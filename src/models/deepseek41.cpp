@@ -380,10 +380,14 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
         const int64_t n_cols = (pmodel.hparams.engram_max_ngram_size - 1) * pmodel.hparams.engram_n_head;
+        if (emb != nullptr) {
+            return emb->ne[1] == params.ubatch.n_tokens;
+        }
         return rows->ne[0] == n_cols * params.ubatch.n_tokens;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
+    ggml_tensor * emb  = nullptr;   // F32 [key_len * n_cols, n_tokens] when the gather runs on the host
 
     const llama_model_deepseek41 & pmodel;
 
@@ -395,7 +399,22 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<float>       gathered;
 };
+
+// The engram table lives on the host (lazy mmap). Gathering its rows in set_input() instead of with a
+// CPU get_rows node keeps the forward graph device-only: no CPU split in the middle of every forward and
+// no device-wide sync at its boundary. The rows are dequantized with the same to_float routine the CPU
+// get_rows uses, so the values are identical. LLAMA_ENGRAM_HOST_GATHER=0 restores the graph gather.
+// (port of WyvernTKC/llama.cpp-4xV100@095ee2a21)
+static bool engram_host_gather(const ggml_tensor * table) {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_ENGRAM_HOST_GATHER");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on && table->data != nullptr && table->buffer != nullptr && ggml_backend_buffer_is_host(table->buffer) &&
+        ggml_get_type_traits(table->type)->to_float != nullptr;
+}
 
 void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
@@ -495,6 +514,21 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         llama_prefetch_ranges(addrs.data(), sizes.data(), addrs.size());
     }
 
+    if (emb != nullptr) {
+        const int il = (int) hp.engram_layer_ids[eg];
+        const ggml_tensor * table = pmodel.layers[il].engram_embd;
+        const int64_t key_len = table->ne[0];
+        const auto * traits = ggml_get_type_traits(table->type);
+        gathered.resize(idx.size()*key_len);
+        for (size_t i = 0; i < idx.size(); ++i) {
+            GGML_ASSERT(idx[i] >= 0 && idx[i] < table->ne[1]);
+            const uint8_t * row = (const uint8_t *) table->data + (size_t) idx[i]*table->nb[1];
+            traits->to_float(row, gathered.data() + i*key_len, key_len);
+        }
+        ggml_backend_tensor_set(emb, gathered.data(), 0, gathered.size()*sizeof(float));
+        return;
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -509,6 +543,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il));
+
+    if (engram_host_gather(model.layers[il].engram_embd)) {
+        inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, key_len * n_cols, n_tokens);
+        ggml_set_input(inp->emb);
+        ggml_tensor * emb = inp->emb;
+        res->add_input(std::move(inp));
+        cb(emb, "engram_embd", il);
+        return emb;
+    }
 
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);

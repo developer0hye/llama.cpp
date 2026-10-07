@@ -379,6 +379,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+    // DeepSeek-V4.1 TP tuning (A/B switches, defaults are the tuned values):
+    //  - output.weight is split by vocab rows instead of mirrored: every GPU otherwise reads the whole
+    //    1.3 GB BF16 head per token (LLAMA_DSV41_TP_OUTPUT_MIRROR=1 restores mirroring).
+    //  - routed/shared expert ffn dim splits at quant-block granularity: 2304 = 72 MXFP4 blocks -> 9 per GPU
+    //    on 8 GPUs instead of 128-col chunks (2..3 chunks = 256/384 cols, 1.33x imbalance)
+    //    (LLAMA_DSV41_TP_FFN_GRAN=128 restores the generic granularity).
+    const bool is_dsv41 = ud->model->arch == LLM_ARCH_DEEPSEEK41;
+    static const bool dsv41_output_mirror = [] {
+        const char * e = getenv("LLAMA_DSV41_TP_OUTPUT_MIRROR");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static const int64_t dsv41_ffn_gran = [] {
+        const char * e = getenv("LLAMA_DSV41_TP_FFN_GRAN");
+        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -584,7 +599,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            if (is_dsv4 && !(is_dsv41 && !dsv41_output_mirror)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
@@ -778,7 +793,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            int64_t blck_size_perf = std::lcm(blck_size, 128);
+            if (is_dsv41) {
+                blck_size_perf = dsv41_ffn_gran > 0 ? std::lcm(blck_size, dsv41_ffn_gran) : blck_size;
+            }
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }

@@ -1746,13 +1746,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // Tensor parallelism (meta split backend): a user input otherwise costs one meta synchronize
+        // (n_dev stream syncs) plus n_dev synchronous copies, ~20 inputs per DeepSeek-V4.1 decode step.
+        // Synchronize once per split, then enqueue the copies on the device streams. Host input buffers
+        // are only rewritten by the next set_input, which follows the output read's synchronize.
+        const bool split_is_meta = ggml_backend_is_meta(split_backend);
+        bool split_synced = false;
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (input->flags & GGML_TENSOR_FLAG_INPUT && split_is_meta && input->buffer != NULL &&
+                    ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
+                if (!split_synced) {
+                    ggml_backend_synchronize(split_backend);
+                    split_synced = true;
+                }
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                ggml_backend_sched_record_copy(sched, input_backend, split_backend, input,
+                    "graph_input", ggml_nbytes(input), true);
+                ++n_graph_inputs;
+            } else if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 const int64_t t0 = sched->timings ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {

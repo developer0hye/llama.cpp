@@ -1020,7 +1020,20 @@ struct ggml_backend_cuda_comm_context {
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
+    // Whole-step CUDA graphs for tensor parallelism (see ggml_backend_cuda_comm_graph_compute):
+    // one executable graph per device holding every subgraph of a step plus the AllReduces between them.
+    std::vector<cudaGraphExec_t> step_execs;
+    uint64_t                     step_uid     = 0; // uid of the ggml graph the step_execs were captured from
+    uint64_t                     step_pending = 0; // uid seen once, captured on the next call with the same uid
+    bool                         step_failed  = false;
+
     ~ggml_backend_cuda_comm_context() {
+        for (size_t i = 0; i < step_execs.size(); ++i) {
+            if (step_execs[i] != nullptr) {
+                ggml_cuda_set_device(dev_ids[i]);
+                (void) cudaGraphExecDestroy(step_execs[i]);
+            }
+        }
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -6081,6 +6094,134 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Tensor-parallel step as one CUDA graph per device.
+//
+// The meta backend splits a TP step into n_sub subgraphs per device with an AllReduce after each but the
+// last. Driving that from the host costs n_sub * n_dev graph launches plus n_sub NCCL group calls per step
+// (DeepSeek-V4.1 decode on 8 GPUs: 81 * 8 launches, ~40 us each), and the host, not the GPUs, sets the pace.
+// Here every device's subgraphs and the NCCL AllReduces between them are captured into a single graph per
+// device; while the ggml graph is reused (same uid) a step is just n_dev cudaGraphLaunch calls.
+//
+// cgraphs is laid out [i_sub*n_dev + j]. Returns false (caller falls back to the per-subgraph path) when
+// disabled (GGML_CUDA_TP_STEP_GRAPH=0), without NCCL, for uid 0, on the first call with a new uid
+// (lets pools/warmup settle, as the per-subgraph CUDA graphs also do), or when a subgraph can't be captured.
+static bool ggml_backend_cuda_comm_graph_compute(void * comm_ctx_v, struct ggml_cgraph ** cgraphs, size_t n_sub, uint64_t uid) {
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_NCCL)
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_TP_STEP_GRAPH");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (!enabled || comm_ctx == nullptr || comm_ctx->comms.empty() || comm_ctx->step_failed || uid == 0 ||
+            ggml_cuda_graph::disabled_by_env()) {
+        return false;
+    }
+    const size_t n_dev = comm_ctx->backends.size();
+
+    if (comm_ctx->step_uid == uid && !comm_ctx->step_execs.empty()) {
+        for (size_t j = 0; j < n_dev; ++j) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            CUDA_CHECK(cudaGraphLaunch(comm_ctx->step_execs[j], cuda_ctx->stream()));
+        }
+        return true;
+    }
+
+    if (comm_ctx->step_pending != uid) {
+        comm_ctx->step_pending = uid;
+        return false;
+    }
+
+    for (size_t i = 0; i < n_sub*n_dev; ++i) {
+        if (!ggml_cuda_graph_check_compability(cgraphs[i])) {
+            return false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (size_t j = 0; j < n_dev; ++j) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+    }
+    std::vector<ggml_tensor *> last(n_dev);
+    for (size_t i = 0; i < n_sub; ++i) {
+        for (size_t j = 0; j < n_dev; ++j) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+            ggml_cgraph * cg = cgraphs[i*n_dev + j];
+            ggml_cuda_set_device(cuda_ctx->device);
+            // eager evaluation into the outer capture; graph_key 0 never collides with a cached subgraph
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cg, /*use_cuda_graph =*/ false, /*update =*/ false, /*graph_key =*/ 0);
+            last[j] = cg->nodes[cg->n_nodes - 1];
+        }
+        if (i + 1 < n_sub) {
+            ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, last.data());
+        }
+    }
+    std::vector<cudaGraph_t> graphs(n_dev, nullptr);
+    bool ok = true;
+    for (size_t j = 0; j < n_dev; ++j) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        const cudaError_t err = cudaStreamEndCapture(cuda_ctx->stream(), &graphs[j]);
+        if (err != cudaSuccess) {
+            GGML_LOG_WARN("%s: step capture failed on device %d: %s\n", __func__, cuda_ctx->device, cudaGetErrorString(err));
+            (void) cudaGetLastError();
+            ok = false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+    if (!ok) {
+        // the captured work never ran; give up on step graphs and let the caller run the step eagerly
+        for (cudaGraph_t g : graphs) {
+            if (g != nullptr) {
+                (void) cudaGraphDestroy(g);
+            }
+        }
+        comm_ctx->step_failed = true;
+        return false;
+    }
+
+    comm_ctx->step_execs.resize(n_dev, nullptr);
+    for (size_t j = 0; j < n_dev; ++j) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        bool updated = false;
+        if (comm_ctx->step_execs[j] != nullptr) {
+            cudaGraphExecUpdateResultInfo info;
+            updated = cudaGraphExecUpdate(comm_ctx->step_execs[j], graphs[j], &info) == cudaSuccess;
+            if (!updated) {
+                (void) cudaGetLastError();
+                CUDA_CHECK(cudaGraphExecDestroy(comm_ctx->step_execs[j]));
+                comm_ctx->step_execs[j] = nullptr;
+            }
+        }
+        if (!updated) {
+            CUDA_CHECK(cudaGraphInstantiate(&comm_ctx->step_execs[j], graphs[j], NULL, NULL, 0));
+        }
+        CUDA_CHECK(cudaGraphDestroy(graphs[j]));
+    }
+    comm_ctx->step_uid = uid;
+    for (size_t j = 0; j < n_dev; ++j) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaGraphLaunch(comm_ctx->step_execs[j], cuda_ctx->stream()));
+    }
+    return true;
+#else
+    GGML_UNUSED(comm_ctx_v); GGML_UNUSED(cgraphs); GGML_UNUSED(n_sub); GGML_UNUSED(uid);
+    return false;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6091,6 +6232,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_graph_compute") == 0) {
+        return (void *)ggml_backend_cuda_comm_graph_compute;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

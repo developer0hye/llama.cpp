@@ -529,7 +529,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+            // a source-less op (e.g. GGML_OP_ARANGE, used by DeepSeek-V4.1's engram gain dequant) produces
+            // the same values on every device
+            bool has_src = false;
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                has_src = has_src || (tensor->src[i] != nullptr && tensor->src[i] != tensor);
+            }
+            ret = has_src ? ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1}
+                          : ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -1808,6 +1815,11 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // optional: run all subgraphs + AllReduces of a step as one captured graph per device (CUDA + NCCL)
+    typedef bool (*comm_graph_compute_t)(void * comm_ctx, ggml_cgraph ** cgraphs, size_t n_sub, uint64_t uid);
+    comm_graph_compute_t                 comm_graph_compute = nullptr;
+    std::vector<ggml_cgraph *>           step_cgraphs;
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1838,6 +1850,8 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            comm_graph_compute = (comm_graph_compute_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_graph_compute");
         }
     }
 
@@ -1869,6 +1883,9 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    if (size == 0 || ggml_nelements(tensor) == 0) {
+        return; // empty inputs (e.g. no compressor rows this ubatch) have no split state
+    }
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
@@ -2433,6 +2450,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+
+    if (backend_ctx->comm_graph_compute != nullptr && n_backends > 1) {
+        auto & sc = backend_ctx->step_cgraphs;
+        sc.resize(backend_ctx->n_subgraphs*n_backends);
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+            for (size_t j = 0; j < n_backends; j++) {
+                sc[i*n_backends + j] = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+            }
+        }
+        // a rebuild may have created new simple tensors, so never replay a step captured before it
+        const uint64_t uid = needs_rebuild ? 0 : cgraph->uid;
+        if (backend_ctx->comm_graph_compute(backend_ctx->comm_ctx, sc.data(), backend_ctx->n_subgraphs, uid)) {
+            return GGML_STATUS_SUCCESS;
+        }
+    }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
