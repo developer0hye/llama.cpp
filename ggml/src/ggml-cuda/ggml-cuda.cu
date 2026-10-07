@@ -1102,6 +1102,7 @@ struct ggml_backend_cuda_comm_context {
     double                       ev_max_ms    = 0.0;
     int64_t                      ev_n         = 0;
     bool                         ev_pending   = false;
+    bool                         last_was_replay = false;
     ggml_cuda_tp_ar *            tp_ar        = nullptr; // one-shot P2P AllReduce for small tensors (GGML_CUDA_TP_P2P_AR)
     int64_t                      t_launch_us  = 0;   // GGML_CUDA_TP_STEP_TIMING=1: host time spent launching
     int64_t                      n_launch     = 0;
@@ -6333,6 +6334,7 @@ static bool ggml_backend_cuda_comm_graph_compute(void * comm_ctx_v, struct ggml_
             };
         }
         comm_ctx->ev_pending = step_events;
+        comm_ctx->last_was_replay = true;
         comm_ctx->launcher->run();
         if (timing) {
             comm_ctx->t_launch_us += ggml_time_us() - t0;
@@ -6351,8 +6353,13 @@ static bool ggml_backend_cuda_comm_graph_compute(void * comm_ctx_v, struct ggml_
 
     // First call with a new uid (prefill ubatches, changing batch sizes, KV boundaries): run eagerly, every device
     // driven by its own thread; capturing and instantiating a graph that is used only once costs more than it saves.
-    if (!compatible || comm_ctx->step_pending != uid) {
+    // A new uid right after replays (decode crossing a KV / top-k shape boundary) is captured at once: the next
+    // step will reuse it. After eager runs (prefill ubatches, changing batch shapes) wait for a repeat first.
+    const bool capture_now = comm_ctx->last_was_replay;
+    comm_ctx->last_was_replay = false;
+    if (!compatible || (comm_ctx->step_pending != uid && !capture_now)) {
         comm_ctx->step_pending = uid;
+        const int64_t t_e0 = timing ? ggml_time_us() : 0;
         for (size_t j = 0; j < n_dev; ++j) {
             comm_ctx->launcher->jobs[j] = [comm_ctx, j, cgraphs, n_sub, n_dev] {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
@@ -6367,6 +6374,9 @@ static bool ggml_backend_cuda_comm_graph_compute(void * comm_ctx_v, struct ggml_
             };
         }
         comm_ctx->launcher->run();
+        if (timing) {
+            GGML_LOG_INFO("%s: eager step %.1f ms (host)\n", __func__, (ggml_time_us() - t_e0)/1000.0);
+        }
         return true;
     }
 

@@ -1256,7 +1256,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // parallelism also recaptures the per-device step graphs (~100 ms on DeepSeek-V4.1 TP8)
     static const uint32_t n_pad_min = [] {
         const char * e = getenv("LLAMA_KV_NPAD");
-        return e != nullptr && atoi(e) > 0 ? (uint32_t) atoi(e) : 256u;
+        return e != nullptr && atoi(e) > 0 ? (uint32_t) atoi(e) : 1024u; // DeepSeek-V4.1 fork default (T17)
     }();
     const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
 

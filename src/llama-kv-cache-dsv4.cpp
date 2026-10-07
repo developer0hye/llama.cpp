@@ -644,7 +644,18 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     // Keep the mask (and with it the compressed-attention branch) present even
     // before the first block is visible, so the graph topology never changes.
     // Padded slots are masked out; comp cache buffers are zero-initialized.
-    plan.n_kv = std::max<int64_t>(GGML_PAD(plan.n_kv, 256u), 256);
+    // LLAMA_DSV4_COMP_NPAD (default 1024): coarser padding means fewer graph rebuilds while decoding. Every
+    // change of n_kv rebuilds the graph and, under tensor parallelism, recaptures the per-device step graphs
+    // (~100-150 ms on DeepSeek-V4.1 TP8); with 256 that happens every 256 tokens. Never beyond the cache.
+    static const int64_t comp_pad = [] {
+        const char * e = getenv("LLAMA_DSV4_COMP_NPAD");
+        const int64_t v = e != nullptr ? atoll(e) : 1024; // 1024: rebuild every 1024 tokens, +0.05 ms/token (T17)
+        return v >= 256 && v % 256 == 0 ? v : (int64_t) 256;
+    }();
+    {
+        const int64_t n_kv_min = std::max<int64_t>(GGML_PAD(plan.n_kv, 256u), 256);
+        plan.n_kv = std::max<int64_t>(n_kv_min, std::min<int64_t>(GGML_PAD(plan.n_kv, comp_pad), kv_size));
+    }
 
     std::sort(persist_rows.begin(), persist_rows.end(),
             [](const persist_row & a, const persist_row & b) {
