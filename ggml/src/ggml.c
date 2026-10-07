@@ -6536,6 +6536,27 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
     return result;
 }
 
+// ggml_dsv4_hc_mix
+
+struct ggml_tensor * ggml_dsv4_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    struct ggml_tensor * comb = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
+    // reuse the validated comb node, reshaped to the full mix layout
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, mixes->ne[0], mixes->ne[1]);
+    memcpy(result->op_params, comb->op_params, sizeof(result->op_params));
+    ggml_set_op_params_i32(result, 2, 1);
+    result->op     = GGML_OP_DSV4_HC_COMB;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+    return result;
+}
+
 // ggml_dsv4_hc_pre
 
 static struct ggml_tensor * ggml_dsv4_hc_pre_impl(

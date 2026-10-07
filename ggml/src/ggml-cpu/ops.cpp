@@ -11166,10 +11166,17 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
 
     const int64_t n_tokens = mixes->ne[1];
 
+    // full: dst is [hc_mix_dim, n_tokens] holding pre, post and comb (ggml_dsv4_hc_mix)
+    const bool full = ggml_get_op_params_i32(dst, 2) != 0;
     GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
-    GGML_ASSERT(dst->ne[0] == hc);
-    GGML_ASSERT(dst->ne[1] == hc);
-    GGML_ASSERT(dst->ne[2] == n_tokens);
+    if (full) {
+        GGML_ASSERT(dst->ne[0] == hc_mix_dim);
+        GGML_ASSERT(dst->ne[1] == n_tokens);
+    } else {
+        GGML_ASSERT(dst->ne[0] == hc);
+        GGML_ASSERT(dst->ne[1] == hc);
+        GGML_ASSERT(dst->ne[2] == n_tokens);
+    }
     GGML_ASSERT(scale->ne[0] >= 3);
     GGML_ASSERT(base->ne[0] == hc_mix_dim);
 
@@ -11226,6 +11233,23 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
             ggml_dsv4_hc_comb_norm_cols(comb, eps);
         }
 
+        if (full) {
+            // same op sequence as the unfused graph: mul, add, sigmoid, then scale_bias(1, eps) / scale(2)
+            const float scale_pre  = *(const float *) ((const char *) scale->data + 0*nbs0);
+            const float scale_post = *(const float *) ((const char *) scale->data + 1*nbs0);
+            for (int64_t ih = 0; ih < 2*hc; ++ih) {
+                const float xv = *(const float *) ((const char *) mixes->data + ih*nbm0 + it*nbm1);
+                const float bv = *(const float *) ((const char *) base->data  + ih*nbb0);
+                const float m  = xv * (ih < hc ? scale_pre : scale_post);
+                const float v  = m + bv;
+                const float sg = 1.0f / (1.0f + expf(-v));
+                *(float *) ((char *) dst->data + ih*nbd0 + it*nbd1) = ih < hc ? sg + eps : 2.0f*sg;
+            }
+            for (int64_t idx = 0; idx < hc*hc; ++idx) {
+                *(float *) ((char *) dst->data + (comb_offset + idx)*nbd0 + it*nbd1) = comb[idx];
+            }
+            continue;
+        }
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             for (int64_t idst = 0; idst < hc; ++idst) {
                 const int64_t idx = idst + hc*isrc;

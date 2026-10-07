@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/tp-allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1094,6 +1095,7 @@ struct ggml_backend_cuda_comm_context {
     uint64_t                     step_pending = 0; // uid seen once, captured on the next call with the same uid
     bool                         step_failed  = false;
     std::unique_ptr<ggml_cuda_tp_launcher> launcher;
+    ggml_cuda_tp_ar *            tp_ar        = nullptr; // one-shot P2P AllReduce for small tensors (GGML_CUDA_TP_P2P_AR)
     int64_t                      t_launch_us  = 0;   // GGML_CUDA_TP_STEP_TIMING=1: host time spent launching
     int64_t                      n_launch     = 0;
 
@@ -1110,6 +1112,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_tp_ar_free(tp_ar);
     }
 };
 
@@ -1131,6 +1134,24 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         GGML_ASSERT(tensors[i] != nullptr);
         GGML_ASSERT(ggml_nelements(tensors[i]) == ne);
         GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
+    }
+
+    // Small f32 tensors (decode activations): one-shot P2P push + local sum, ~3x lower latency than NCCL's ring.
+    if (comm_ctx->tp_ar != nullptr && ne <= ggml_cuda_tp_ar_max_elems(comm_ctx->tp_ar)) {
+        bool ok = true;
+        float *      data[GGML_CUDA_MAX_DEVICES];
+        bool         zero[GGML_CUDA_MAX_DEVICES];
+        cudaStream_t streams[GGML_CUDA_MAX_DEVICES];
+        for (size_t i = 0; i < n_backends; ++i) {
+            ok = ok && tensors[i]->type == GGML_TYPE_F32;
+            data[i]    = (float *) tensors[i]->data;
+            zero[i]    = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+            streams[i] = ((ggml_backend_cuda_context *) comm_ctx->backends[i]->context)->stream();
+        }
+        if (ok) {
+            ggml_cuda_tp_ar_allreduce_f32(comm_ctx->tp_ar, data, zero, ne, streams);
+            return true;
+        }
     }
 
     // For small tensors, simply reduce them as FP32.
@@ -1307,6 +1328,12 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        // default on; GGML_CUDA_TP_P2P_AR=0 keeps every AllReduce on NCCL, =N sets the size cap in f32 elements
+        const char * env = getenv("GGML_CUDA_TP_P2P_AR");
+        const int64_t cap = env == nullptr ? 65536 : (int64_t) atoll(env);
+        if (cap > 0) {
+            ret->tp_ar = ggml_cuda_tp_ar_init(ret->dev_ids.data(), (int) n, GGML_PAD(cap, 4));
+        }
         return;
     }
 

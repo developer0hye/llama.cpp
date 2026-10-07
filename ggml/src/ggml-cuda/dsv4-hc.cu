@@ -33,6 +33,7 @@ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
     }
 }
 
+template <bool full>
 static __global__ void dsv4_hc_comb_f32(
         const float * mixes,
         const float * scale,
@@ -92,6 +93,22 @@ static __global__ void dsv4_hc_comb_f32(
         dsv4_hc_comb_norm_cols(comb, eps);
     }
 
+    if constexpr (full) {
+        // pre/post gates with the unfused graph's op sequence (mul, add, sigmoid, scale_bias / scale) so that
+        // the results are bit-identical: explicit _rn ops keep mul+add from being contracted into an fma
+        const float scale_pre  = scale[0];
+        const float scale_post = scale[ss0];
+        for (int ih = 0; ih < 2*DSV4_HC; ++ih) {
+            const float m  = __fmul_rn(mixes[ih*sm0 + it*sm1], ih < DSV4_HC ? scale_pre : scale_post);
+            const float v  = __fadd_rn(m, base[ih*sb0]);
+            const float sg = 1.0f / (1.0f + expf(-v));
+            dst[ih*sd0 + it*sd1] = ih < DSV4_HC ? 1.0f*sg + eps : 2.0f*sg + 0.0f;
+        }
+        for (int idx = 0; idx < DSV4_HC*DSV4_HC; ++idx) {
+            dst[(comb_offset + idx)*sd0 + it*sd1] = comb[idx];
+        }
+        return;
+    }
     for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
         for (int idst = 0; idst < DSV4_HC; ++idst) {
             const int idx = idst + DSV4_HC*isrc;
@@ -206,10 +223,16 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     constexpr int64_t hc_mix_dim = (2 + DSV4_HC)*DSV4_HC;
 
+    const bool full = ggml_get_op_params_i32(dst, 2) != 0;
     GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
-    GGML_ASSERT(dst->ne[0] == DSV4_HC);
-    GGML_ASSERT(dst->ne[1] == DSV4_HC);
-    GGML_ASSERT(dst->ne[2] == mixes->ne[1]);
+    if (full) {
+        GGML_ASSERT(dst->ne[0] == hc_mix_dim);
+        GGML_ASSERT(dst->ne[1] == mixes->ne[1]);
+    } else {
+        GGML_ASSERT(dst->ne[0] == DSV4_HC);
+        GGML_ASSERT(dst->ne[1] == DSV4_HC);
+        GGML_ASSERT(dst->ne[2] == mixes->ne[1]);
+    }
     GGML_ASSERT(scale->ne[0] >= 3);
     GGML_ASSERT(base->ne[0] == hc_mix_dim);
 
@@ -227,7 +250,7 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((n_tokens + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    ggml_cuda_kernel_launch(dsv4_hc_comb_f32, launch_params,
+    ggml_cuda_kernel_launch(full ? dsv4_hc_comb_f32<true> : dsv4_hc_comb_f32<false>, launch_params,
             (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
             n_tokens,
             nbm0 / sizeof(float), nbm1 / sizeof(float),

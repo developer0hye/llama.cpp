@@ -2673,6 +2673,18 @@ extern "C" {
             float                 eps,
             int32_t               n_iter);
 
+    // hc_mix: hc_comb plus the pre and post gates in one op (DeepSeek-V4/V4.1 decode: one kernel instead of nine)
+    //          -> [(2 + hc)*hc, n_tokens]: rows [0, hc) pre = sigmoid(mixes*scale[0] + base) + eps,
+    //          rows [hc, 2*hc) post = 2*sigmoid(mixes*scale[1] + base), rows [2*hc, ...) comb laid out as hc_comb
+    //          (dst + hc*src). Implemented as GGML_OP_DSV4_HC_COMB with op_params[2] = 1 (CPU and CUDA only).
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
     // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
     //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
     //
