@@ -413,8 +413,10 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     }
 
     static const bool enable_384 = [] {
+        // on by default for DeepSeek-V4.1 (KL vs the argsort path at the noise floor, -1.2 ms/token on TP8);
+        // GGML_CUDA_TOPK_MOE_384=0 restores the unfused router
         const char * value = std::getenv("GGML_CUDA_TOPK_MOE_384");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;
     }();
     if (n_expert == 384 && !enable_384) {
         return false;

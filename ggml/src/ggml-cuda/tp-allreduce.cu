@@ -197,31 +197,41 @@ int64_t ggml_cuda_tp_ar_max_elems(const ggml_cuda_tp_ar * ar) {
     return ar ? ar->max_elems : 0;
 }
 
-void ggml_cuda_tp_ar_allreduce_f32(ggml_cuda_tp_ar * ar, float ** data, const bool * zero, int64_t ne, cudaStream_t * streams) {
-    GGML_ASSERT(ne <= ar->max_elems);
+static void tp_ar_launch(ggml_cuda_tp_ar * ar, int r, float * data, bool zero, int64_t ne, cudaStream_t stream, bool vec) {
     const int n_pair = ar->n_rank / 2;
-    bool vec = ne % 4 == 0 && ar->max_elems % 4 == 0;
-    for (int r = 0; r < ar->n_rank; ++r) {
-        vec = vec && ((uintptr_t) data[r] % 16 == 0);
-    }
+    const int pr = r ^ 1;
     // one 1024-thread block per ~1024 float4: fewest flag polls/fences for decode-sized vectors (5120 f32 ->
     // 1 block, ~21 us on 8 GPUs vs ~24 us NCCL ring + NCCL's graph host nodes; ~/dsv41/tp/arbench)
     const int64_t n_units = vec ? ne/4 : ne;
     const int nblk = (int) std::min<int64_t>(TP_AR_BLOCKS, std::max<int64_t>(1, (n_units + 1023)/1024));
-    for (int r = 0; r < ar->n_rank; ++r) {
-        const int pr = r ^ 1;
-        ggml_cuda_set_device(ar->devices[r]);
-        if (vec) {
-            tp_ar_pair_host<float4><<<nblk, TP_AR_THREADS, 0, streams[r]>>>(
-                    (float4 *) data[r], ne/4, r, n_pair, ar->max_elems/4, zero[r],
-                    (const float4 *) ar->pslot[r], ar->pflag[r], (float4 *) ar->pslot[pr], ar->pflag[pr],
-                    (float4 *) ar->hslot, ar->hflag, ar->ctr[r]);
-        } else {
-            tp_ar_pair_host<float><<<nblk, TP_AR_THREADS, 0, streams[r]>>>(
-                    data[r], ne, r, n_pair, ar->max_elems, zero[r],
-                    ar->pslot[r], ar->pflag[r], ar->pslot[pr], ar->pflag[pr],
-                    ar->hslot, ar->hflag, ar->ctr[r]);
-        }
-        CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_set_device(ar->devices[r]);
+    if (vec) {
+        tp_ar_pair_host<float4><<<nblk, TP_AR_THREADS, 0, stream>>>(
+                (float4 *) data, ne/4, r, n_pair, ar->max_elems/4, zero,
+                (const float4 *) ar->pslot[r], ar->pflag[r], (float4 *) ar->pslot[pr], ar->pflag[pr],
+                (float4 *) ar->hslot, ar->hflag, ar->ctr[r]);
+    } else {
+        tp_ar_pair_host<float><<<nblk, TP_AR_THREADS, 0, stream>>>(
+                data, ne, r, n_pair, ar->max_elems, zero,
+                ar->pslot[r], ar->pflag[r], ar->pslot[pr], ar->pflag[pr],
+                ar->hslot, ar->hflag, ar->ctr[r]);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_tp_ar_allreduce_f32(ggml_cuda_tp_ar * ar, float ** data, const bool * zero, int64_t ne, cudaStream_t * streams) {
+    GGML_ASSERT(ne <= ar->max_elems);
+    // the vector path must be chosen identically on every rank: decide from ne only (ggml tensors are 16B aligned)
+    const bool vec = ne % 4 == 0 && ar->max_elems % 4 == 0;
+    for (int r = 0; r < ar->n_rank; ++r) {
+        GGML_ASSERT(!vec || (uintptr_t) data[r] % 16 == 0);
+        tp_ar_launch(ar, r, data[r], zero[r], ne, streams[r], vec);
+    }
+}
+
+void ggml_cuda_tp_ar_allreduce_f32_rank(ggml_cuda_tp_ar * ar, int rank, float * data, bool zero, int64_t ne, cudaStream_t stream) {
+    GGML_ASSERT(ne <= ar->max_elems);
+    const bool vec = ne % 4 == 0 && ar->max_elems % 4 == 0;
+    GGML_ASSERT(!vec || (uintptr_t) data % 16 == 0);
+    tp_ar_launch(ar, rank, data, zero, ne, stream, vec);
 }

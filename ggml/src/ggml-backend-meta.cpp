@@ -2459,8 +2459,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 sc[i*n_backends + j] = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
             }
         }
-        // a rebuild may have created new simple tensors, so never replay a step captured before it
-        const uint64_t uid = needs_rebuild ? 0 : cgraph->uid;
+        // a rebuild creates new simple tensors: the uid changed (or is 0), so the CUDA side recaptures
+        const uint64_t uid = cgraph->uid;
         if (backend_ctx->comm_graph_compute(backend_ctx->comm_ctx, sc.data(), backend_ctx->n_subgraphs, uid)) {
             return GGML_STATUS_SUCCESS;
         }

@@ -18,3 +18,6 @@ int64_t           ggml_cuda_tp_ar_max_elems(const ggml_cuda_tp_ar * ar);
 // data[r]: f32 vector of ne elements on device devices[r] (in place); zero[r]: rank contributes zeros;
 // streams[r]: stream to enqueue on. All ranks must call this the same number of times in the same order.
 void ggml_cuda_tp_ar_allreduce_f32(ggml_cuda_tp_ar * ar, float ** data, const bool * zero, int64_t ne, cudaStream_t * streams);
+
+// same, for one rank only (for per-device host threads); every rank must make the same sequence of calls
+void ggml_cuda_tp_ar_allreduce_f32_rank(ggml_cuda_tp_ar * ar, int rank, float * data, bool zero, int64_t ne, cudaStream_t stream);
