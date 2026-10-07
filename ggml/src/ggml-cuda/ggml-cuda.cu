@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/tp-allreduce.cuh"
+#include "ggml-cuda/dsv41-fused.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1095,6 +1096,12 @@ struct ggml_backend_cuda_comm_context {
     uint64_t                     step_pending = 0; // uid seen once, captured on the next call with the same uid
     bool                         step_failed  = false;
     std::unique_ptr<ggml_cuda_tp_launcher> launcher;
+    // GGML_CUDA_TP_STEP_EVENTS=1: GPU time of each device's step graph (cudaEvents around the launch)
+    std::vector<cudaEvent_t>     ev0, ev1;
+    std::vector<double>          ev_ms;
+    double                       ev_max_ms    = 0.0;
+    int64_t                      ev_n         = 0;
+    bool                         ev_pending   = false;
     ggml_cuda_tp_ar *            tp_ar        = nullptr; // one-shot P2P AllReduce for small tensors (GGML_CUDA_TP_P2P_AR)
     int64_t                      t_launch_us  = 0;   // GGML_CUDA_TP_STEP_TIMING=1: host time spent launching
     int64_t                      n_launch     = 0;
@@ -4401,6 +4408,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // DeepSeek-V4.1: rms_norm of the hc stream feeding the [hc_dim, 24] F32 mix projection
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes &&
+            ggml_cuda_dsv41_can_fuse_rms_mul_mat(node, cgraph->nodes[i + 1]) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT }, { i + 1 })) {
+        ggml_cuda_dsv41_rms_mul_mat(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -6209,7 +6224,12 @@ static void ggml_backend_cuda_comm_allreduce_rank(ggml_backend_cuda_comm_context
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
     ggml_cuda_set_device(cuda_ctx->device);
     const int64_t ne = ggml_nelements(t);
-    if (ne == 0) {
+    static const bool ar_skip = [] {
+        // measurement only: skip every AllReduce (results are wrong) to time the step without communication
+        const char * e = getenv("GGML_CUDA_TP_AR_SKIP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (ne == 0 || ar_skip) {
         return;
     }
     GGML_ASSERT(ggml_is_contiguously_allocated(t));
@@ -6261,15 +6281,58 @@ static bool ggml_backend_cuda_comm_graph_compute(void * comm_ctx_v, struct ggml_
     }
     comm_ctx->step_execs.resize(n_dev, nullptr);
 
+    static const bool step_events = [] {
+        const char * e = getenv("GGML_CUDA_TP_STEP_EVENTS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (step_events && comm_ctx->ev0.empty()) {
+        comm_ctx->ev0.resize(n_dev); comm_ctx->ev1.resize(n_dev); comm_ctx->ev_ms.assign(n_dev, 0.0);
+        for (size_t j = 0; j < n_dev; ++j) {
+            ggml_cuda_set_device(((ggml_backend_cuda_context *) comm_ctx->backends[j]->context)->device);
+            CUDA_CHECK(cudaEventCreate(&comm_ctx->ev0[j]));
+            CUDA_CHECK(cudaEventCreate(&comm_ctx->ev1[j]));
+        }
+    }
+    if (step_events && comm_ctx->ev_pending) {
+        // the previous step finished (the caller synchronized before setting new inputs)
+        double mx = 0.0;
+        for (size_t j = 0; j < n_dev; ++j) {
+            float ms = 0.0f;
+            ggml_cuda_set_device(((ggml_backend_cuda_context *) comm_ctx->backends[j]->context)->device);
+            if (cudaEventElapsedTime(&ms, comm_ctx->ev0[j], comm_ctx->ev1[j]) == cudaSuccess) {
+                comm_ctx->ev_ms[j] += ms; mx = std::max(mx, (double) ms);
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        comm_ctx->ev_max_ms += mx;
+        comm_ctx->ev_pending = false;
+        if (++comm_ctx->ev_n % 200 == 0) {
+            std::string per;
+            for (size_t j = 0; j < n_dev; ++j) {
+                per += " " + std::to_string(comm_ctx->ev_ms[j]/comm_ctx->ev_n).substr(0, 6);
+            }
+            GGML_LOG_INFO("tp_step_events: n=%" PRId64 " step graph GPU ms per device:%s | max %.3f\n",
+                    comm_ctx->ev_n, per.c_str(), comm_ctx->ev_max_ms/comm_ctx->ev_n);
+        }
+    }
+
     if (comm_ctx->step_uid == uid) {
         const int64_t t0 = timing ? ggml_time_us() : 0;
         for (size_t j = 0; j < n_dev; ++j) {
             comm_ctx->launcher->jobs[j] = [comm_ctx, j] {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
                 ggml_cuda_set_device(cuda_ctx->device);
+                if (step_events) {
+                    CUDA_CHECK(cudaEventRecord(comm_ctx->ev0[j], cuda_ctx->stream()));
+                }
                 CUDA_CHECK(cudaGraphLaunch(comm_ctx->step_execs[j], cuda_ctx->stream()));
+                if (step_events) {
+                    CUDA_CHECK(cudaEventRecord(comm_ctx->ev1[j], cuda_ctx->stream()));
+                }
             };
         }
+        comm_ctx->ev_pending = step_events;
         comm_ctx->launcher->run();
         if (timing) {
             comm_ctx->t_launch_us += ggml_time_us() - t0;

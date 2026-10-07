@@ -898,12 +898,32 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// LLAMA_DECODE_TIMING=1: per single-token decode host phase timing (printed every 256 decodes)
+struct llama_decode_timing {
+    bool    on = [] { const char * e = getenv("LLAMA_DECODE_TIMING"); return e != nullptr && atoi(e) != 0; }();
+    int64_t n = 0, t_decode = 0, t_reuse = 0, t_inputs = 0, t_compute = 0, t_sync = 0, n_sync = 0, t_between = 0, t_last_end = 0;
+    void report() {
+        if (++n % 256 == 0) {
+            LLAMA_LOG_INFO("decode_timing: n=%" PRId64 " per token ms: llama_decode %.3f (graph check %.3f, set_inputs %.3f, compute launch %.3f) "
+                "sync wait %.3f (%.1f calls) caller between decodes %.3f\n", n,
+                t_decode/1e3/n, t_reuse/1e3/n, t_inputs/1e3/n, t_compute/1e3/n, t_sync/1e3/n, (double) n_sync/n, t_between/1e3/n);
+        }
+    }
+};
+static llama_decode_timing g_dt;
+static thread_local bool g_dt_single = false;
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
 
+    const int64_t t_sync0 = g_dt.on ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    if (g_dt.on) {
+        g_dt.t_sync += ggml_time_us() - t_sync0;
+        g_dt.n_sync++;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1723,6 +1743,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    const int64_t t_pu0 = g_dt.on ? ggml_time_us() : 0;
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1773,6 +1794,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t t_pu1 = g_dt.on ? ggml_time_us() : 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1783,7 +1805,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_pu2 = g_dt.on ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (g_dt.on && ubatch.n_tokens == 1) {
+        const int64_t t_pu3 = ggml_time_us();
+        g_dt.t_reuse += t_pu1 - t_pu0; g_dt.t_inputs += t_pu2 - t_pu1; g_dt.t_compute += t_pu3 - t_pu2;
+        g_dt_single = true;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4776,7 +4804,20 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    const int64_t t0 = g_dt.on ? ggml_time_us() : 0;
+    g_dt_single = false;
     const int ret = ctx->decode(batch);
+    if (g_dt.on && g_dt_single && batch.n_tokens == 1) {
+        const int64_t t1 = ggml_time_us();
+        g_dt.t_decode += t1 - t0;
+        if (g_dt.t_last_end > 0) {
+            g_dt.t_between += t0 - g_dt.t_last_end;
+        }
+        g_dt.t_last_end = t1;
+        g_dt.report();
+    } else if (g_dt.on) {
+        g_dt.t_last_end = 0;
+    }
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
