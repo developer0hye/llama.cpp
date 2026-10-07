@@ -2203,6 +2203,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                    if (i + 1 == cgraph->n_nodes) {
+                        // a host-input view can end the graph (e.g. DeepSeek-V4.1 gather-K mask views): close the subgraph
+                        for (size_t j = 0; j < n_backends; j++) {
+                            backend_ctx->backend_configs[j].cgraphs[n_subgraphs].offset = i_start;
+                        }
+                        n_subgraphs++;
+                        i_start = i + 1;
+                    }
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);

@@ -121,6 +121,14 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // Candidate prefilter (DeepSeek-V4.1 fork, LLAMA_SAMPLER_PREFILTER=0 disables). For chains made only of
+    // top-k / top-p / min-p / temperature <= 1 / dist|greedy, the lowest-logit tokens whose total probability
+    // mass is below eps (default 1e-5) are dropped before the chain runs (mass histogram, see
+    // set_logits_prefiltered). The 129k-entry candidate array + softmax + sort cost ~1.1 ms
+    // per token on this box; the prefilter is three linear passes. Greedy results are identical.
+    bool prefilter = false;
+    std::vector<llama_token> prefilter_keep; // positively biased tokens are always kept
+
     void reset() {
         prev.clear();
 
@@ -152,13 +160,75 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            if (prefilter && n_vocab > 4096) {
+                set_logits_prefiltered(logits, n_vocab);
+            } else {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // e^x for x <= 0 to ~1e-3 relative, vectorisable (only used to size the threshold)
+    static inline float fast_exp_neg(float x) {
+        x = x < -87.0f ? -87.0f : x;
+        const float t = x * 1.44269504f;            // log2(e)
+        const float fi = floorf(t);
+        const float f = t - fi;                     // [0, 1)
+        const float p = 1.0f + f*(0.6931472f + f*(0.2402265f + f*(0.0555041f + f*0.0096181f)));
+        union { int32_t i; float v; } u;
+        u.i = (int32_t) (fi + 127.0f) << 23;
+        return u.v * p;
+    }
+
+    void set_logits_prefiltered(const float * logits, int n_vocab) {
+        float m = -INFINITY;
+        for (int i = 0; i < n_vocab; ++i) {
+            m = logits[i] > m ? logits[i] : m;
+        }
+        // histogram of the probability mass by distance below the max (1/4-nat bins, 64 nats): the threshold is
+        // the highest bin edge such that everything below it carries <= 1e-7 of the total mass (exp to ~1e-3)
+        constexpr int   NB = 256;
+        constexpr float BW = 0.25f;
+        float hist[NB + 1] = {0.0f};
+        float z = 0.0f;
+        for (int i = 0; i < n_vocab; ++i) {
+            const float d = m - logits[i];
+            const float e = fast_exp_neg(-d);
+            z += e;
+            int b = (int) (d * (1.0f/BW));
+            b = b < 0 ? 0 : (b > NB ? NB : b);
+            hist[b] += e;
+        }
+        float tail = 0.0f;
+        int   cut  = NB + 1;   // keep bins [0, cut)
+        // excluded mass eps changes every kept probability by a factor 1/(1-eps) and can flip a top-p / min-p
+        // decision only when the cumulative sum lands within eps of the cutoff (LLAMA_SAMPLER_PREFILTER_EPS)
+        static const float eps = [] {
+            const char * e = getenv("LLAMA_SAMPLER_PREFILTER_EPS");
+            return e != nullptr ? (float) atof(e) : 1e-5f;
+        }();
+        const float budget = 0.5f * eps * z;
+        while (cut > 1 && tail + hist[cut - 1] <= budget) {
+            tail += hist[cut - 1];
+            --cut;
+        }
+        const float t = cut > NB ? -INFINITY : m - cut*BW;
+        cur.clear();
+        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+            if (logits[token_id] >= t) {
+                cur.push_back(llama_token_data{token_id, logits[token_id], 0.0f});
+            }
+        }
+        for (llama_token token_id : prefilter_keep) {
+            if (token_id >= 0 && token_id < n_vocab && logits[token_id] < t) {
+                cur.push_back(llama_token_data{token_id, logits[token_id], 0.0f});
+            }
+        }
     }
 
     common_time_meas tm() {
@@ -434,6 +504,61 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
     };
 
+    {
+        static const bool prefilter_env = [] {
+            const char * e = getenv("LLAMA_SAMPLER_PREFILTER");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        bool ok = prefilter_env && grmr == nullptr && rbudget == nullptr && params.mirostat == 0 &&
+            params.temp <= 1.0f && params.dynatemp_range == 0.0f && params.adaptive_target < 0.0f;
+        for (const auto t : params.samplers) {
+            switch (t) {
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    break;
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                    ok = ok && params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_DRY:
+                    ok = ok && params.dry_multiplier == 0.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    ok = ok && params.top_n_sigma < 0.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                    ok = ok && params.typ_p >= 1.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_XTC:
+                    ok = ok && (params.xtc_probability <= 0.0f || params.xtc_threshold > 0.5f);
+                    break;
+                default:
+                    ok = false;
+                    break;
+            }
+        }
+        result->prefilter = ok;
+        {
+            static int last = -1;
+            if (last != (int) ok) {
+                last = (int) ok;
+                LOG_INF("%s: candidate prefilter %s (grammar %d, rbudget %d, temp %.2f, mirostat %d, n_samplers %zu)\n", __func__,
+                        ok ? "on" : "off", grmr != nullptr, rbudget != nullptr, params.temp, params.mirostat, params.samplers.size());
+            }
+        }
+        for (const auto & lb : params.logit_bias) {
+            if (lb.bias > 0.0f) {
+                result->prefilter_keep.push_back(lb.token);
+            }
+        }
+        for (const auto & lb : params.logit_bias_eog) {
+            if (lb.bias > 0.0f) {
+                result->prefilter_keep.push_back(lb.token);
+            }
+        }
+    }
+
     return result;
 }
 
@@ -515,6 +640,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .prefilter      = */ gsmpl->prefilter,
+        /* .prefilter_keep = */ gsmpl->prefilter_keep,
     };
 }
 
@@ -534,6 +661,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->prev       = src->prev;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
+    dst->prefilter      = src->prefilter;
+    dst->prefilter_keep = src->prefilter_keep;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
 }

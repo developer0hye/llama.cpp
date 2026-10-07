@@ -1086,13 +1086,54 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
     cb(comp_k, "comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+    ggml_tensor * k_all    = nullptr;
+    ggml_tensor * kq_mask  = nullptr;
+
+    // Decode: every query shares one top-k pick, so gather the picked compressed rows and their mask entries
+    // instead of concatenating the whole (padded) compressed stream and masking it. Attention then costs the
+    // same at any n_kv padding, which lets the KV / compressed-plan padding be coarse (fewer graph rebuilds).
+    // (after WyvernTKC/llama.cpp-4xV100@095ee2a21). OFF by default: in this tree the gathered K no longer
+    // satisfies the sparse MMA FA support check, so the scheduler moves FA to the CPU (T19). LLAMA_DSV4_GATHER_K=1.
+    static const bool gather_k = [] {
+        const char * e = getenv("LLAMA_DSV4_GATHER_K");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (gather_k && nt == 1 && cparams.flash_attn && comp_k->type == GGML_TYPE_F16 && raw_mask->type == GGML_TYPE_F16 &&
+            top_k_carry->ne[1] == 1) {
+        const int64_t n_top = top_k_carry->ne[0];
+        const int64_t ns    = comp_k->ne[3];
+        GGML_ASSERT(top_k_carry->ne[3] == ns && inp_comp.kq_mask->ne[3] == ns && raw_mask->ne[3] == ns);
+
+        ggml_tensor * idx = ggml_view_2d(ctx0, top_k_carry, n_top, ns, top_k_carry->nb[3], 0);
+
+        ggml_tensor * comp_rows = ggml_view_3d(ctx0, comp_k, comp_k->ne[0], n_comp, ns, comp_k->nb[2], comp_k->nb[3], 0);
+        ggml_tensor * k_sel = ggml_get_rows(ctx0, comp_rows, idx);
+        k_sel = ggml_cast(ctx0, k_sel, comp_k->type);
+        k_sel = ggml_reshape_4d(ctx0, k_sel, comp_k->ne[0], 1, n_top, ns);
+        cb(k_sel, "comp_k_sel", il);
+
+        k_all = ggml_concat(ctx0, raw_k, k_sel, 2);
+
+        // copy the (host-side input) mask to the device first: a view of an input tensor would be placed on
+        // the CPU by the scheduler and split the graph
+        ggml_tensor * mask_dev  = ggml_cast(ctx0, inp_comp.kq_mask, GGML_TYPE_F32);
+        ggml_tensor * mask_rows = ggml_view_3d(ctx0, mask_dev, 1, n_comp, ns,
+                mask_dev->nb[0], mask_dev->nb[3], 0);
+        ggml_tensor * m_sel = ggml_get_rows(ctx0, mask_rows, idx);
+        m_sel = ggml_cast(ctx0, m_sel, raw_mask->type);
+        m_sel = ggml_reshape_4d(ctx0, m_sel, n_top, 1, 1, ns);
+        m_sel = ggml_repeat_4d(ctx0, m_sel, n_top, raw_mask->ne[1], 1, ns);
+        cb(m_sel, "comp_mask_sel", il);
+
+        kq_mask = ggml_concat(ctx0, raw_mask, m_sel, 0);
+    } else {
+        k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+
+        ggml_tensor * comp_mask = build_top_k_mask(inp_comp.kq_mask, top_k_carry, "comp_top_k_mask", il);
+        kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+    }
     cb(k_all, "k_all", il);
-
-    ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
-    ggml_tensor * comp_mask = build_top_k_mask(inp_comp.kq_mask, top_k_carry, "comp_top_k_mask", il);
-
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
     cb(kq_mask, "kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k_carry->ne[0];
