@@ -78,6 +78,8 @@
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
+#include <functional>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
@@ -995,6 +997,71 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     return &ggml_backend_cuda_buffer_types[device];
 }
 
+// Launches one closure per device from per-device worker threads. cudaGraphLaunch of a whole TP step
+// graph costs ~100+ us of host time per device; issued serially, device n-1 starts (n-1) launches late
+// and every device then idles at the first AllReduce. Workers spin briefly, then sleep on a condvar.
+struct ggml_cuda_tp_launcher {
+    std::vector<std::thread>           threads;
+    std::vector<std::function<void()>> jobs;
+    std::atomic<uint64_t>              gen{0};
+    std::atomic<int>                   pending{0};
+    std::atomic<bool>                  stop{false};
+    std::mutex                         mtx;
+    std::condition_variable            cv;
+
+    explicit ggml_cuda_tp_launcher(int n_workers) : jobs(n_workers + 1) {
+        for (int w = 1; w <= n_workers; ++w) {
+            threads.emplace_back([this, w] {
+                uint64_t seen = 0;
+                while (true) {
+                    int spins = 0;
+                    while (gen.load(std::memory_order_acquire) == seen && !stop.load(std::memory_order_relaxed)) {
+                        if (++spins > 20000) {
+                            std::unique_lock<std::mutex> lock(mtx);
+                            cv.wait(lock, [&] { return gen.load(std::memory_order_acquire) != seen || stop.load(); });
+                            break;
+                        }
+#if defined(__x86_64__)
+                        __builtin_ia32_pause();
+#endif
+                    }
+                    if (stop.load()) {
+                        return;
+                    }
+                    seen = gen.load(std::memory_order_acquire);
+                    jobs[w]();
+                    pending.fetch_sub(1, std::memory_order_acq_rel);
+                }
+            });
+        }
+    }
+    ~ggml_cuda_tp_launcher() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+    // jobs[0] runs on the calling thread
+    void run() {
+        pending.store((int) threads.size(), std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            gen.fetch_add(1, std::memory_order_acq_rel);
+        }
+        cv.notify_all();
+        jobs[0]();
+        while (pending.load(std::memory_order_acquire) != 0) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
+};
+
 // Communication context for multi-GPU AllReduce during tensor parallelism.
 //
 // Created once per meta backend instance.  Resources for the selected mode
@@ -1026,6 +1093,9 @@ struct ggml_backend_cuda_comm_context {
     uint64_t                     step_uid     = 0; // uid of the ggml graph the step_execs were captured from
     uint64_t                     step_pending = 0; // uid seen once, captured on the next call with the same uid
     bool                         step_failed  = false;
+    std::unique_ptr<ggml_cuda_tp_launcher> launcher;
+    int64_t                      t_launch_us  = 0;   // GGML_CUDA_TP_STEP_TIMING=1: host time spent launching
+    int64_t                      n_launch     = 0;
 
     ~ggml_backend_cuda_comm_context() {
         for (size_t i = 0; i < step_execs.size(); ++i) {
@@ -6118,12 +6188,46 @@ static bool ggml_backend_cuda_comm_graph_compute(void * comm_ctx_v, struct ggml_
     }
     const size_t n_dev = comm_ctx->backends.size();
 
-    if (comm_ctx->step_uid == uid && !comm_ctx->step_execs.empty()) {
-        for (size_t j = 0; j < n_dev; ++j) {
-            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
-            ggml_cuda_set_device(cuda_ctx->device);
-            CUDA_CHECK(cudaGraphLaunch(comm_ctx->step_execs[j], cuda_ctx->stream()));
+    static const bool timing = [] {
+        const char * e = getenv("GGML_CUDA_TP_STEP_TIMING");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static const bool parallel_launch = [] {
+        const char * e = getenv("GGML_CUDA_TP_PARALLEL_LAUNCH");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    auto launch_all = [&]() {
+        const int64_t t0 = timing ? ggml_time_us() : 0;
+        if (parallel_launch && n_dev > 1) {
+            if (!comm_ctx->launcher) {
+                comm_ctx->launcher = std::make_unique<ggml_cuda_tp_launcher>((int) n_dev - 1);
+                for (size_t j = 0; j < n_dev; ++j) {
+                    comm_ctx->launcher->jobs[j] = [comm_ctx, j] {
+                        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+                        ggml_cuda_set_device(cuda_ctx->device);
+                        CUDA_CHECK(cudaGraphLaunch(comm_ctx->step_execs[j], cuda_ctx->stream()));
+                    };
+                }
+            }
+            comm_ctx->launcher->run();
+        } else {
+            for (size_t j = 0; j < n_dev; ++j) {
+                ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
+                ggml_cuda_set_device(cuda_ctx->device);
+                CUDA_CHECK(cudaGraphLaunch(comm_ctx->step_execs[j], cuda_ctx->stream()));
+            }
         }
+        if (timing) {
+            comm_ctx->t_launch_us += ggml_time_us() - t0;
+            if (++comm_ctx->n_launch % 64 == 0) {
+                GGML_LOG_INFO("%s: avg step launch %.1f us over %" PRId64 " steps\n", __func__,
+                        (double) comm_ctx->t_launch_us / comm_ctx->n_launch, comm_ctx->n_launch);
+            }
+        }
+    };
+
+    if (comm_ctx->step_uid == uid && !comm_ctx->step_execs.empty()) {
+        launch_all();
         return true;
     }
 
@@ -6211,10 +6315,12 @@ static bool ggml_backend_cuda_comm_graph_compute(void * comm_ctx_v, struct ggml_
     }
     comm_ctx->step_uid = uid;
     for (size_t j = 0; j < n_dev; ++j) {
+        // upload now so the first replay does not pay for it
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[j]->context;
         ggml_cuda_set_device(cuda_ctx->device);
-        CUDA_CHECK(cudaGraphLaunch(comm_ctx->step_execs[j], cuda_ctx->stream()));
+        CUDA_CHECK(cudaGraphUpload(comm_ctx->step_execs[j], cuda_ctx->stream()));
     }
+    launch_all();
     return true;
 #else
     GGML_UNUSED(comm_ctx_v); GGML_UNUSED(cgraphs); GGML_UNUSED(n_sub); GGML_UNUSED(uid);
