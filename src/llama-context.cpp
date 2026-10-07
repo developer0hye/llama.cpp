@@ -600,6 +600,16 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
+            if (device_fused != device_layer && device_layer && ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                // a weightless fused node at a device boundary follows the producer of its inputs to the
+                // previous device (the unfused ops land there too); the layer device supports the op, so
+                // this is placement, not missing support
+                LLAMA_LOG_INFO("%s: layer %d: %s placed on %s by the scheduler, %s supports it, keeping it enabled\n",
+                        func, node.il, probe.name, device_fused ? ggml_backend_dev_name(device_fused) : "none",
+                        ggml_backend_dev_name(device_layer));
+                continue;
+            }
+
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
