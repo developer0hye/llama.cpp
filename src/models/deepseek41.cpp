@@ -1090,6 +1090,30 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     ggml_tensor * k_all    = nullptr;
     ggml_tensor * kq_mask  = nullptr;
 
+    // Decode / small verify batches: one op reads the window rows and the picked compressed rows in place
+    // (ggml_dsv41_attn_decode) instead of concat + mask build + flash attention (LLAMA_DSV41_ATTN_DECODE=0).
+    static const bool attn_decode = [] {
+        const char * e = getenv("LLAMA_DSV41_ATTN_DECODE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (attn_decode && nt <= 8 && cparams.flash_attn && comp_k->type == GGML_TYPE_F16 && raw_k->type == GGML_TYPE_F16 &&
+            raw_mask->type == GGML_TYPE_F16 && inp_comp.kq_mask->type == GGML_TYPE_F16 &&
+            q->ne[0] == 512 && top_k_carry->ne[1] == nt / comp_k->ne[3]) {
+        const int64_t ns = comp_k->ne[3];
+        ggml_tensor * q4 = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/ns, ns, q->nb[1], q->nb[2], q->nb[3]/ns, 0);
+        ggml_tensor * comp_rows = ggml_view_4d(ctx0, comp_k, comp_k->ne[0], 1, n_comp, ns,
+                comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
+        out = ggml_dsv41_attn_decode(ctx0, q4, raw_k, raw_mask, comp_rows, inp_comp.kq_mask, top_k_carry,
+                layer.attn_sinks, kq_scale);
+        out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
+        cb(out, "attn_out_raw", il);
+
+        return build_attention_tail(model, out, inp_pos, nt, il);
+    }
+
     // Decode: every query shares one top-k pick, so gather the picked compressed rows and their mask entries
     // instead of concatenating the whole (padded) compressed stream and masking it. Attention then costs the
     // same at any n_kv padding, which lets the KV / compressed-plan padding be coarse (fewer graph rebuilds).

@@ -1517,6 +1517,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // Tensor parallelism: a CPU input layer costs a separate CPU graph split (embedding get_rows) plus a host
+    // round trip on every decode step. Keep the embedding table on the meta device instead (mirrored,
+    // +1.3 GB/GPU for DeepSeek-V4.1); LLAMA_TP_INPUT_ON_DEVICE=0 restores the CPU placement.
+    {
+        static const bool input_on_dev = [] {
+            const char * e = getenv("LLAMA_TP_INPUT_ON_DEVICE");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (input_on_dev && params.split_mode == LLAMA_SPLIT_MODE_TENSOR && n_gpu_layers > 0 && !devices.empty()) {
+            pimpl->dev_input = get_layer_buft_list(0);
+        }
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

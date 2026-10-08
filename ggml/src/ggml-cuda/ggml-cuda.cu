@@ -5,6 +5,8 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/tp-allreduce.cuh"
 #include "ggml-cuda/dsv41-fused.cuh"
+#include "ggml-cuda/dsv41-attn.cuh"
+#include "ggml-cuda/dsv41k-kernels.h"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -2537,6 +2539,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_DSV41_ATTN_DECODE:
+            ggml_cuda_op_dsv41_attn_decode(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -3482,7 +3487,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ffn_up   = cgraph->nodes[node_idx + 1];
         const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
 
-        if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
+        // build_ffn emits up before gate (the dispatcher accepts both orders; DeepSeek-V4.1 shared expert)
+        if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu) || ggml_cuda_should_fuse_mul_mat(ffn_gate, ffn_up, glu)) {
             int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
@@ -3693,6 +3699,72 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// DeepSeek-V4.1 TP8 MoE down (workstream B kernel, ggml-cuda/dsv41k-moe-down.cu): MXFP4 experts with the
+// per-GPU K=288 slice, 6 used experts, 5120 rows, <= 8 tokens: down projection + routing-weight multiply +
+// expert sum in one kernel, q8_1 activation quantization in-kernel (bit-identical to quantize_q8_1), fixed
+// slot-order sum (batch invariant). GGML_CUDA_DSV41_MOE_DOWN=0 disables.
+static bool ggml_cuda_dsv41_match_moe_down(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_moe_down_reduction_match & match) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_DSV41_MOE_DOWN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!enabled || node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    if (mmid->op != GGML_OP_MUL_MAT_ID || mmid->type != GGML_TYPE_F32 || !ggml_is_contiguous(mmid)) {
+        return false;
+    }
+    const ggml_tensor * w = mmid->src[0], * act = mmid->src[1], * ids = mmid->src[2];
+    static int n_dbg0 = getenv("DSV41_MOE_DEBUG") ? 8 : 0;
+    static int n_dbg  = getenv("DSV41_MOE_DEBUG") ? 8 : 0;
+    if (n_dbg0 > 0 && w->type == GGML_TYPE_MXFP4) {
+        n_dbg0--;
+        GGML_LOG_INFO("dsv41 moe_down: %s w=[%lld,%lld,%lld] nb2=%zu act=[%lld,%lld,%lld] ids=[%lld,%lld] ctg=%d/%d\n", mmid->name,
+                (long long) w->ne[0], (long long) w->ne[1], (long long) w->ne[2], w->nb[2], (long long) act->ne[0], (long long) act->ne[1],
+                (long long) act->ne[2], (long long) ids->ne[0], (long long) ids->ne[1], ggml_is_contiguous(act), ggml_is_contiguous(ids));
+    }
+    if (w->type != GGML_TYPE_MXFP4 || w->ne[0] != 288 || w->ne[1] != 5120 || w->ne[3] != 1 || w->nb[2] % 16 != 0 ||
+            act->type != GGML_TYPE_F32 || act->ne[0] != 288 || act->ne[1] != 6 || act->ne[2] < 1 || act->ne[2] > 8 ||
+            act->ne[3] != 1 || !ggml_is_contiguous(act) || ids->type != GGML_TYPE_I32 || ids->ne[0] != 6 ||
+            ids->ne[1] != act->ne[2] || ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0) {
+        return false;
+    }
+    ggml_cuda_moe_weighted_reduction_match reduction;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction, true) ||
+            reduction.experts != mmid || reduction.expert_scale != nullptr) {
+        if (n_dbg > 0) {
+            n_dbg--;
+            GGML_LOG_INFO("dsv41 moe_down: no weighted reduction after %s; next ops:", mmid->name);
+            for (int k = node_idx + 1; k < std::min(cgraph->n_nodes, node_idx + 8); ++k) {
+                GGML_LOG_INFO(" %s(%s)", ggml_op_name(cgraph->nodes[k]->op), cgraph->nodes[k]->name);
+            }
+            GGML_LOG_INFO("\n");
+        }
+        return false;
+    }
+    const ggml_tensor * wts = reduction.weights;
+    const ggml_tensor * dst = reduction.dst;
+    if (wts->type != GGML_TYPE_F32 || ggml_nelements(wts) != 6*act->ne[2] || !ggml_is_contiguous(wts) ||
+            dst->type != GGML_TYPE_F32 || dst->ne[0] != 5120 || ggml_nelements(dst) != 5120*act->ne[2] || !ggml_is_contiguous(dst)) {
+        if (n_dbg > 0) { n_dbg--; GGML_LOG_INFO("dsv41 moe_down: weights/dst shape reject at %s\n", mmid->name); }
+        return false;
+    }
+    const int node_count = reduction.node_count + 1;
+    const int output_idx = node_idx + node_count - 1;
+    std::vector<ggml_op> ops(node_count);
+    for (int i = 0; i < node_count; ++i) {
+        ops[i] = cgraph->nodes[node_idx + i]->op;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+        if (n_dbg > 0) { n_dbg--; GGML_LOG_INFO("dsv41 moe_down: can_fuse_subgraph failed (%d nodes) at %s\n", node_count, mmid->name); }
+        return false;
+    }
+    match.matrix = w; match.input = act; match.ids = ids; match.weights = wts; match.dst = reduction.dst;
+    match.node_count = node_count;
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3705,6 +3777,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
         ggml_cuda_moe_down_reduction_match match;
+        if (ggml_cuda_dsv41_match_moe_down(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                dsv41_moe_down_args a{};
+                a.w = match.matrix->data; a.expert_stride = match.matrix->nb[2]; a.w_shared = nullptr;
+                a.act = (const float *) match.input->data; a.act_shared = nullptr;
+                a.ids = (const int32_t *) match.ids->data; a.weights = (const float *) match.weights->data;
+                a.out = (float *) match.dst->data;
+                a.n_tok = (int) match.input->ne[2]; a.n_used = 6; a.rows = 5120; a.K = 288;
+                a.ids_stride = (int) (match.ids->nb[1] / sizeof(int32_t));
+                dsv41_moe_down(a, cuda_ctx->stream());
+                return match.node_count - 1;
+            }
+        }
         if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
@@ -6026,6 +6112,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_DSV41_ATTN_DECODE:
+            return ggml_cuda_dsv41_attn_decode_supported(op);
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&

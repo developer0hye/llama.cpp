@@ -1045,6 +1045,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_KPOOL_EXPAND: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            case GGML_OP_DSV41_ATTN_DECODE: {
+                // heads (q axis 1, sinks axis 0) split, all KV / mask / index inputs mirrored
+                for (int k = 1; k <= 5; k++) {
+                    GGML_ASSERT(src_ss[k].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = src_ss[0];
+            } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST: {

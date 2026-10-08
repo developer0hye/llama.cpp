@@ -575,6 +575,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV41_ATTN_DECODE,
 
         GGML_OP_UNARY,
 
@@ -2715,6 +2716,25 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // DeepSeek-V4.1 decode attention over two KV sources without materialising them (ai-8a6000 fork):
+    //   q         [D, H, n_tok, n_seq] f32   (rope/rotation already applied)
+    //   raw_k     [D, 1, n_raw, n_seq] f16   sliding-window latent (K == V), raw_mask [n_raw, >=n_tok, 1, n_seq] f16
+    //   comp_k    [D, 1, n_comp, n_seq] f16  compressed latent rows, comp_mask [n_comp, >=n_tok, 1, n_seq] f16
+    //   top_k     [n_top, n_tok, 1, n_seq] i32  per-token picked compressed rows
+    //   sinks     [H] f32
+    // -> [D, H, n_tok, n_seq] f32: softmax over (scale*q.k + mask) of the raw rows and the picked compressed
+    //    rows plus a value-less sink logit per head, times the same rows as values.
+    GGML_API struct ggml_tensor * ggml_dsv41_attn_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * raw_k,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * comp_k,
+            struct ggml_tensor  * comp_mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * sinks,
+            float                 scale);
 
     // custom operators
 

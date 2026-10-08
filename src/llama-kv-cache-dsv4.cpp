@@ -605,6 +605,34 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
+    // Odd ubatch sizes (e.g. speculative verify widths 3, 5) complete a varying number of ratio>1 rows per
+    // ubatch (1, 2, 1, 2, ...), which changes these input shapes, rebuilds the graph and, under tensor
+    // parallelism, forces an eager step every other call. Pad every sequence to the maximum block count of
+    // this ubatch size with dummy blocks that write to the last (masked, never live) cache slot.
+    if (!overlap && !plan.state_pos.empty() && ratio > 1 && !dsv4_ubatch_has_coupled(ubatch) && plan.n_kv < (int64_t) kv_size) {
+        const uint32_t n_blocks = (std::max<uint32_t>(1, ubatch.n_seq_tokens) + ratio - 1)/ratio;
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+            uint32_t i = 0;
+            while (i < ubatch.n_tokens && (ubatch.pos[i] < 0 || !dsv4_token_has_seq(ubatch, i, seq_id))) {
+                ++i;
+            }
+            if (i >= ubatch.n_tokens) {
+                continue;
+            }
+            const int64_t cache_off = dsv4_stream_offset(n_stream, seq_id, kv_size);
+            const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
+            for (uint32_t n_writes = state_write_counts[seq_id]; n_writes < n_blocks; ++n_writes) {
+                plan.state_write_idxs.push_back(cache_off + kv_size - 1);
+                plan.state_write_pos .push_back(0);
+                for (uint32_t j = 0; j < ratio; ++j) {
+                    plan.state_read_idxs.push_back(source_idx);
+                }
+            }
+            state_write_counts[seq_id] = std::max(state_write_counts[seq_id], n_blocks);
+        }
+    }
+
     if (!overlap && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
         assert(kv_size > 0);
         // the last slot must not be live, or the dummy write would corrupt it;

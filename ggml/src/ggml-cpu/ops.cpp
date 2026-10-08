@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <vector>
 #include <cfloat>
 #include <cmath>
 
@@ -12274,5 +12275,64 @@ void ggml_compute_forward_kpool_expand(
             dst_row[n_select*kpool + i] = std::isfinite(GGML_CPU_FP16_TO_FP32(tail_mask_row[i])) ?
                     tail_cells_row[i] : -1;
         }
+    }
+}
+
+// ggml_compute_forward_dsv41_attn_decode (reference implementation, see ggml.h)
+
+void ggml_compute_forward_dsv41_attn_decode(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q         = dst->src[0];
+    const ggml_tensor * raw_k     = dst->src[1];
+    const ggml_tensor * raw_mask  = dst->src[2];
+    const ggml_tensor * comp_k    = dst->src[3];
+    const ggml_tensor * comp_mask = dst->src[4];
+    const ggml_tensor * top_k     = dst->src[5];
+    const ggml_tensor * sinks     = dst->src[6];
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t D = q->ne[0], H = q->ne[1], NT = q->ne[2], NS = q->ne[3];
+    const int64_t n_raw = raw_k->ne[2], n_top = top_k->ne[0];
+
+    std::vector<float> s(n_raw + n_top), acc(D);
+    const int64_t n_rows = H*NT*NS;
+    for (int64_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int64_t h = ir % H, t = (ir / H) % NT, sq = ir / (H*NT);
+        const float * qv = (const float *) ((const char *) q->data + h*q->nb[1] + t*q->nb[2] + sq*q->nb[3]);
+        auto krow = [&](int64_t r) -> const ggml_fp16_t * {
+            if (r < n_raw) {
+                return (const ggml_fp16_t *) ((const char *) raw_k->data + r*raw_k->nb[2] + sq*raw_k->nb[3]);
+            }
+            const int32_t idx = *(const int32_t *) ((const char *) top_k->data + (r - n_raw)*top_k->nb[0] + t*top_k->nb[1] + sq*top_k->nb[3]);
+            return (const ggml_fp16_t *) ((const char *) comp_k->data + idx*comp_k->nb[2] + sq*comp_k->nb[3]);
+        };
+        auto mval = [&](int64_t r) -> float {
+            if (r < n_raw) {
+                return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) raw_mask->data + r*raw_mask->nb[0] + t*raw_mask->nb[1] + sq*raw_mask->nb[3]));
+            }
+            const int32_t idx = *(const int32_t *) ((const char *) top_k->data + (r - n_raw)*top_k->nb[0] + t*top_k->nb[1] + sq*top_k->nb[3]);
+            return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) comp_mask->data + idx*comp_mask->nb[0] + t*comp_mask->nb[1] + sq*comp_mask->nb[3]));
+        };
+        float m = sinks ? ((const float *) sinks->data)[h] : -INFINITY;
+        for (int64_t r = 0; r < n_raw + n_top; ++r) {
+            const float mv = mval(r);
+            if (mv == -INFINITY) { s[r] = -INFINITY; continue; }
+            const ggml_fp16_t * k = krow(r);
+            float d = 0.0f;
+            for (int64_t i = 0; i < D; ++i) { d += qv[i]*GGML_CPU_FP16_TO_FP32(k[i]); }
+            s[r] = d*scale + mv;
+            m = s[r] > m ? s[r] : m;
+        }
+        float l = sinks ? expf(((const float *) sinks->data)[h] - m) : 0.0f;
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        for (int64_t r = 0; r < n_raw + n_top; ++r) {
+            if (s[r] == -INFINITY) { continue; }
+            const float p = expf(s[r] - m);
+            l += p;
+            const ggml_fp16_t * k = krow(r);
+            for (int64_t i = 0; i < D; ++i) { acc[i] += p*GGML_CPU_FP16_TO_FP32(k[i]); }
+        }
+        float * o = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2] + sq*dst->nb[3]);
+        const float il = l > 0.0f ? 1.0f/l : 0.0f;
+        for (int64_t i = 0; i < D; ++i) { o[i] = acc[i]*il; }
     }
 }

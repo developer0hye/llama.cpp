@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV41_ATTN_DECODE",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1201,6 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv41_attn_decode(q, raw_k, raw_mask, comp_k, comp_mask, top_k, sinks)",
 
     "unary(x)",
 
@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6554,6 +6556,43 @@ struct ggml_tensor * ggml_dsv4_hc_mix(
     result->src[0] = mixes;
     result->src[1] = scale;
     result->src[2] = base;
+    return result;
+}
+
+// ggml_dsv41_attn_decode
+
+struct ggml_tensor * ggml_dsv41_attn_decode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * raw_k,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * comp_k,
+        struct ggml_tensor  * comp_mask,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * sinks,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(raw_k->type == GGML_TYPE_F16 && comp_k->type == GGML_TYPE_F16);
+    GGML_ASSERT(raw_mask->type == GGML_TYPE_F16 && comp_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(sinks == NULL || sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(raw_k->ne[0] == q->ne[0] && comp_k->ne[0] == q->ne[0]);
+    GGML_ASSERT(raw_k->ne[1] == 1 && comp_k->ne[1] == 1);
+    GGML_ASSERT(raw_mask->ne[0] == raw_k->ne[2] && comp_mask->ne[0] == comp_k->ne[2]);
+    GGML_ASSERT(raw_mask->ne[1] >= q->ne[2] && comp_mask->ne[1] >= q->ne[2] && top_k->ne[1] == q->ne[2]);
+    GGML_ASSERT(raw_k->ne[3] == q->ne[3] && comp_k->ne[3] == q->ne[3] && top_k->ne[3] == q->ne[3]);
+    GGML_ASSERT(sinks == NULL || sinks->ne[0] == q->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
+    ggml_set_op_params_f32(result, 0, scale);
+    result->op     = GGML_OP_DSV41_ATTN_DECODE;
+    result->src[0] = q;
+    result->src[1] = raw_k;
+    result->src[2] = raw_mask;
+    result->src[3] = comp_k;
+    result->src[4] = comp_mask;
+    result->src[5] = top_k;
+    result->src[6] = sinks;
     return result;
 }
 
