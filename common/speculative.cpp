@@ -1213,8 +1213,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
                 causal_attn = std::strcmp(buf, "true") == 0;
             }
-            if (is_dspark &&
-                    llama_model_meta_val_str(model_dft, "dflash.dsv41_semantics", buf, sizeof(buf)) >= 0 && std::strcmp(buf, "true") == 0 &&
+            bool has_single_pass = llama_model_meta_val_str(model_dft, "dflash.hyper_connection.single_pass", buf, sizeof(buf)) >= 0;
+            if (!has_single_pass) {
+                has_single_pass = llama_model_meta_val_str(model_dft, "dflash.dsv41_semantics", buf, sizeof(buf)) >= 0;
+            }
+            const bool dsv41_semantics = has_single_pass && std::strcmp(buf, "true") == 0;
+            if (is_dspark && dsv41_semantics &&
                     llama_model_meta_val_str(model_dft, "dflash.attention.sliding_window", buf, sizeof(buf)) >= 0) {
                 dsv41_window = std::atoi(buf);
                 const char * env = std::getenv("LLAMA_DSPARK_EXACT_WINDOW");

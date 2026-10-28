@@ -40,7 +40,9 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     // DeepSeek-V4 DSpark backbone: stages are full DSV4 blocks, uniform sliding window (the draft KV ring)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {
-        ml.get_key(LLM_KV_DFLASH_DSV41_SEMANTICS,            hparams.dflash_dsv41_semantics, false);
+        if (!ml.get_key(LLM_KV_HYPER_CONNECTION_SINGLE_PASS, hparams.dflash_dsv41_semantics, false)) {
+            ml.get_key(LLM_KV_DFLASH_DSV41_SEMANTICS, hparams.dflash_dsv41_semantics, false);
+        }
         ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
         ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
         ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,    hparams.n_ff_exp_arr, hparams.n_layer_all);
