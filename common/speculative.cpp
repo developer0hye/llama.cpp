@@ -1057,8 +1057,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 memcpy(f.data() + k*(size_t) n_embd_tgt, layer + (size_t) (i0 + r)*n_embd_tgt, (size_t) n_embd_tgt*sizeof(float));
             }
         }
-        // keep a bounded window of recent positions
-        while (!fold_feat.empty() && fold_feat.rbegin()->first - fold_feat.begin()->first > 256) {
+        // A prefill chunk can exceed the retained window. Its unconsumed rows
+        // must remain available until fold_inject_range() has injected them.
+        while (!fold_feat.empty() && fold_feat.rbegin()->first - fold_feat.begin()->first > 256 &&
+                fold_feat.begin()->first <= fold_injected_upto) {
             fold_feat.erase(fold_feat.begin());
         }
     }
