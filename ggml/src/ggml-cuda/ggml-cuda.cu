@@ -5058,7 +5058,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cuda_moe_down_reduction_match match;
-                if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
+                if (ggml_cuda_dsv41_match_moe_down(cgraph, i, match) ||
+                        ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
                     params->add_alloc_dep(
                         params->user_data, const_cast<ggml_tensor *>(match.input), match.dst);
                     params->add_alloc_dep(
