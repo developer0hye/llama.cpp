@@ -77,6 +77,10 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // DeepSeek-V4.1 DSpark draft context: an embd batch of dspark_fold_n_inj feature rows followed by one
+    // block of noise rows (token ids carried in column 0) is one folded inject+draft graph (0 = off)
+    uint32_t dspark_fold_n_inj = 0;
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

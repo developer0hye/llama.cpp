@@ -2069,6 +2069,13 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
         n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
+        // DeepSeek-V4.1 batch-invariant verification (GGML_CUDA_DSV41_BI): the raw window attention must see
+        // the same KV length in a decode step and in a speculative verification batch, otherwise the FA launch
+        // (KV split / sink handling) differs once the padded length crosses a 256 step. Use the full ring.
+        static const bool bi = getenv("GGML_CUDA_DSV41_BI") && atoi(getenv("GGML_CUDA_DSV41_BI")) != 0;
+        if (bi) {
+            n_kv = kv_swa->get_size();
+        }
     }
 
     return res;

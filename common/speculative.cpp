@@ -11,6 +11,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "gguf.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -21,6 +22,8 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <thread>
+#include <functional>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -979,6 +982,199 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // block-internal attention
     bool causal_attn = false;
 
+    // DeepSeek-V4.1 DSpark: the draft ring holds exactly the last dsv41_window committed main-KV rows
+    // (reference DSparkAttention); 0 = not a V4.1 drafter
+    int32_t dsv41_window = 0;
+
+    // DeepSeek-V4.1 DSpark host Markov chain (LLAMA_DSPARK_HOST_MARKOV=1, required under -sm tensor where
+    // the vocab-split draft logits cannot take the in-graph bias/argmax): the draft graph stops at the base
+    // logits and the semi-autoregressive chain tok[i+1] = argmax(base[i] + W2 * W1[tok[i]]) runs here.
+    // host_markov_cand = 0: exact over the full vocab; > 0: over the top-C base logits only.
+    bool host_markov = false;
+    int32_t host_markov_cand = 0;
+    int32_t markov_rank = 0;
+    int32_t markov_vocab = 0;
+    std::vector<float> markov_w1; // [vocab][rank]
+    std::vector<float> markov_w2; // [vocab][rank]
+
+    static bool load_markov_tensor(const char * path, const char * name, std::vector<float> & out, int32_t & rank, int32_t & vocab) {
+        ggml_context * meta = nullptr;
+        gguf_init_params ip = { /*no_alloc =*/ true, /*ctx =*/ &meta };
+        gguf_context * g = gguf_init_from_file(path, ip);
+        if (!g) {
+            return false;
+        }
+        bool ok = false;
+        const int64_t id = gguf_find_tensor(g, name);
+        ggml_tensor * t = meta ? ggml_get_tensor(meta, name) : nullptr;
+        if (id >= 0 && t && (t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32)) {
+            rank  = (int32_t) t->ne[0];
+            vocab = (int32_t) t->ne[1];
+            const size_t off = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, id);
+            std::vector<uint8_t> raw(ggml_nbytes(t));
+            FILE * f = fopen(path, "rb");
+            if (f && fseeko(f, (off_t) off, SEEK_SET) == 0 && fread(raw.data(), 1, raw.size(), f) == raw.size()) {
+                const int64_t n = ggml_nelements(t);
+                out.resize(n);
+                if (t->type == GGML_TYPE_BF16) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), out.data(), n);
+                } else if (t->type == GGML_TYPE_F16) {
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), out.data(), n);
+                } else {
+                    memcpy(out.data(), raw.data(), n*sizeof(float));
+                }
+                ok = true;
+            }
+            if (f) {
+                fclose(f);
+            }
+        }
+        gguf_free(g);
+        if (meta) {
+            ggml_free(meta);
+        }
+        return ok;
+    }
+
+    float markov_w2_maxnorm = 0.0f; // max_v ||W2[v]||, for the exact pruning bound
+
+    // DeepSeek-V4.1 DSpark folded step (LLAMA_DSPARK_FOLD=1, single sequence): instead of one KV-injection
+    // graph per verify batch plus one draft-block graph, the draft context runs ONE graph per cycle with a
+    // fixed shape: the last fold_n_inj committed positions (re-injected, their target features kept here)
+    // followed by the 5-row block. The draft context then reuses one graph (and one TP step capture).
+    bool fold = false;
+    int32_t fold_n_inj = 0;
+    std::map<llama_pos, std::vector<float>> fold_feat; // committed or pending target features by position
+    llama_pos fold_injected_upto = -1;                 // positions [0, upto] are in the draft cache
+
+    void fold_store(const llama_batch & batch_in, int32_t i0, int32_t n_rows) {
+        for (int32_t r = 0; r < n_rows; ++r) {
+            const llama_pos p = batch_in.pos[i0 + r];
+            auto & f = fold_feat[p];
+            f.resize(n_embd_enc);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(params.ctx_tgt, (uint32_t) target_layer_ids[k]);
+                memcpy(f.data() + k*(size_t) n_embd_tgt, layer + (size_t) (i0 + r)*n_embd_tgt, (size_t) n_embd_tgt*sizeof(float));
+            }
+        }
+        // keep a bounded window of recent positions
+        while (!fold_feat.empty() && fold_feat.rbegin()->first - fold_feat.begin()->first > 256) {
+            fold_feat.erase(fold_feat.begin());
+        }
+    }
+
+    // inject stored features for positions [p0, p1) with plain (unfolded) injection graphs
+    bool fold_inject_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(params.ctx_dft);
+        for (llama_pos q0 = p0; q0 < p1; ) {
+            int32_t n_chunk = std::min<int32_t>(n_ubatch, p1 - q0);
+            if (n_chunk == fold_n_inj + block_size) {
+                n_chunk -= 1; // never collide with the folded graph shape
+            }
+            batch_inject.n_tokens = n_chunk;
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                auto it = fold_feat.find(q0 + i);
+                if (it == fold_feat.end()) {
+                    return false;
+                }
+                memcpy(batch_inject.embd + (size_t) i*n_embd_enc, it->second.data(), (size_t) n_embd_enc*sizeof(float));
+                batch_inject.pos[i] = q0 + i;
+                batch_inject.n_seq_id[i] = 1;
+                batch_inject.seq_id[i][0] = seq_id;
+                batch_inject.logits[i] = false;
+            }
+            if (llama_decode(params.ctx_dft, batch_inject) != 0) {
+                return false;
+            }
+            q0 += n_chunk;
+        }
+        fold_injected_upto = std::max(fold_injected_upto, p1 - 1);
+        return true;
+    }
+
+    // argmax_v base[v] + <W2[v], W1[prev]>
+    llama_token host_markov_pick(const float * base, llama_token prev) const {
+        const int32_t R = markov_rank;
+        const float * e = markov_w1.data() + (size_t) prev*R;
+        if (host_markov_cand < 0) {
+            // exact with pruning: |<W2[v], e>| <= max||W2|| * ||e|| =: B. Seed with argmax(base), then only
+            // rows with base[v] + B >= best score can win.
+            float en = 0.0f;
+            for (int32_t k = 0; k < R; ++k) en += e[k]*e[k];
+            const float B = markov_w2_maxnorm*std::sqrt(en)*1.0001f + 1e-6f;
+            int32_t vmax = 0;
+            for (int32_t v = 1; v < markov_vocab; ++v) if (base[v] > base[vmax]) vmax = v;
+            auto score = [&](int32_t v) {
+                const float * w = markov_w2.data() + (size_t) v*R;
+                float acc = 0.0f;
+                for (int32_t k = 0; k < R; ++k) acc += w[k]*e[k];
+                return base[v] + acc;
+            };
+            int32_t best = vmax;
+            float best_s = score(vmax);
+            const float thr = best_s - B;
+            for (int32_t v = 0; v < markov_vocab; ++v) {
+                if (base[v] < thr || v == vmax) continue;
+                const float sc = score(v);
+                if (sc > best_s || (sc == best_s && v < best)) { best_s = sc; best = v; }
+            }
+            return best;
+        }
+        auto score = [&](int32_t v) {
+            const float * w = markov_w2.data() + (size_t) v*R;
+            float acc = 0.0f;
+            for (int32_t k = 0; k < R; ++k) {
+                acc += w[k]*e[k];
+            }
+            return base[v] + acc;
+        };
+        if (host_markov_cand > 0 && host_markov_cand < markov_vocab) {
+            // candidates: base logits within `delta` of the max (one pass); if that set is larger than C,
+            // fall back to the C-th largest (nth_element on a flat copy)
+            static const float delta = std::getenv("LLAMA_DSPARK_HOST_MARKOV_DELTA") ? (float) std::atof(std::getenv("LLAMA_DSPARK_HOST_MARKOV_DELTA")) : 8.0f;
+            float vmax = base[0];
+            for (int32_t v = 1; v < markov_vocab; ++v) vmax = std::max(vmax, base[v]);
+            float thr = vmax - delta;
+            int32_t n_c = 0;
+            for (int32_t v = 0; v < markov_vocab; ++v) n_c += base[v] >= thr;
+            if (n_c > host_markov_cand) {
+                thread_local std::vector<float> vals;
+                vals.assign(base, base + markov_vocab);
+                std::nth_element(vals.begin(), vals.begin() + (host_markov_cand - 1), vals.end(), std::greater<float>());
+                thr = vals[host_markov_cand - 1];
+            }
+            int32_t best = -1;
+            float best_s = -INFINITY;
+            for (int32_t v = 0; v < markov_vocab; ++v) {
+                if (base[v] < thr) continue;
+                const float sc = score(v);
+                if (best < 0 || sc > best_s) { best_s = sc; best = v; }
+            }
+            return best;
+        }
+        const int n_thr = 16;
+        std::vector<std::pair<float, int32_t>> part(n_thr, { -INFINITY, 0 });
+        std::vector<std::thread> th;
+        const int32_t chunk = (markov_vocab + n_thr - 1)/n_thr;
+        for (int t = 0; t < n_thr; ++t) {
+            th.emplace_back([&, t]() {
+                const int32_t v0 = t*chunk, v1 = std::min(markov_vocab, v0 + chunk);
+                std::pair<float, int32_t> b = { -INFINITY, v0 };
+                for (int32_t v = v0; v < v1; ++v) {
+                    const float sc = score(v);
+                    if (sc > b.first) { b = { sc, v }; }
+                }
+                part[t] = b;
+            });
+        }
+        for (auto & x : th) x.join();
+        std::pair<float, int32_t> best = part[0];
+        for (int t = 1; t < n_thr; ++t) {
+            if (part[t].first > best.first) best = part[t];
+        }
+        return best.second;
+    }
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1017,6 +1213,43 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
                 causal_attn = std::strcmp(buf, "true") == 0;
             }
+            bool has_single_pass = llama_model_meta_val_str(model_dft, "dflash.hyper_connection.single_pass", buf, sizeof(buf)) >= 0;
+            if (!has_single_pass) {
+                has_single_pass = llama_model_meta_val_str(model_dft, "dflash.dsv41_semantics", buf, sizeof(buf)) >= 0;
+            }
+            const bool dsv41_semantics = has_single_pass && std::strcmp(buf, "true") == 0;
+            if (is_dspark && dsv41_semantics &&
+                    llama_model_meta_val_str(model_dft, "dflash.attention.sliding_window", buf, sizeof(buf)) >= 0) {
+                dsv41_window = std::atoi(buf);
+                const char * env = std::getenv("LLAMA_DSPARK_EXACT_WINDOW");
+                if (env && std::atoi(env) == 0) {
+                    dsv41_window = 0;
+                }
+            }
+        }
+
+        if (is_dspark) {
+            const char * env = std::getenv("LLAMA_DSPARK_HOST_MARKOV");
+            host_markov = env && std::atoi(env) != 0;
+            const char * envc = std::getenv("LLAMA_DSPARK_HOST_MARKOV_CAND");
+            host_markov_cand = envc ? std::atoi(envc) : 0;
+            if (host_markov) {
+                const char * path = this->params.mparams.path.c_str();
+                int32_t r1 = 0, v1 = 0, r2 = 0, v2 = 0;
+                if (!load_markov_tensor(path, "markov_w1.weight", markov_w1, r1, v1) ||
+                    !load_markov_tensor(path, "markov_w2.weight", markov_w2, r2, v2) || r1 != r2 || v1 != v2) {
+                    throw std::runtime_error("DSpark host Markov: failed to read markov_w1/markov_w2 from the draft GGUF");
+                }
+                markov_rank = r1;
+                markov_vocab = v1;
+                for (int32_t v = 0; v < markov_vocab; ++v) {
+                    float n2 = 0.0f;
+                    for (int32_t k = 0; k < markov_rank; ++k) n2 += markov_w2[(size_t) v*markov_rank + k]*markov_w2[(size_t) v*markov_rank + k];
+                    markov_w2_maxnorm = std::max(markov_w2_maxnorm, std::sqrt(n2));
+                }
+                LOG_INF("%s: DSpark host Markov chain: rank %d, vocab %d, candidates %s\n", __func__, markov_rank, markov_vocab,
+                        host_markov_cand > 0 ? std::to_string(host_markov_cand).c_str() : host_markov_cand < 0 ? "exact-pruned" : "all");
+            }
         }
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
@@ -1037,6 +1270,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        if (dsv41_window > 0) {
+            LOG_INF("%s: - DeepSeek-V4.1 DSpark: exact draft ring of %d committed rows\n", __func__, dsv41_window);
+        }
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1048,6 +1284,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+
+        if (is_dspark && dsv41_window > 0 && n_seq == 1) {
+            const char * env = std::getenv("LLAMA_DSPARK_FOLD");
+            fold = env && std::atoi(env) != 0;
+            if (fold) {
+                fold_n_inj = this->params.n_max + 1;
+                llama_set_dspark_fold(ctx_dft, (uint32_t) fold_n_inj);
+                LOG_INF("%s: DSpark folded step: %d re-injected rows + %d block rows per graph\n", __func__, fold_n_inj, block_size);
+            }
+        }
+
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
@@ -1070,7 +1317,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2) {
+        // host Markov reads the raw draft logits, which backend sampling would not transfer
+        if (this->params.backend_sampling && !is_dflash2 && !host_markov) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1173,6 +1421,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
+            if (fold && has_tokens) {
+                // keep the features; small (verify-sized) batches are injected by the next folded step
+                const llama_pos p_first = batch_in.pos[i_batch_beg[seq_id]];
+                const llama_pos p_last  = batch_in.pos[i_batch_end[seq_id]];
+                // positions from p_first on are (re)written: a new request, a cache-reused prefix or a
+                // rollback. Whatever the draft cache holds from there on is stale.
+                if (p_first <= fold_injected_upto) {
+                    fold_injected_upto = p_first - 1;
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, p_first, -1);
+                }
+                fold_feat.erase(fold_feat.lower_bound(p_first), fold_feat.end());
+                fold_store(batch_in, i_batch_beg[seq_id], n_rows);
+                if (n_rows <= fold_n_inj) {
+                    continue;
+                }
+                // a prefill chunk: inject now (anything pending before it first)
+                if (fold_injected_upto + 1 < p_first && !fold_inject_range(seq_id, fold_injected_upto + 1, p_first)) {
+                    return false;
+                }
+                if (!fold_inject_range(seq_id, p_first, p_last + 1)) {
+                    return false;
+                }
+                continue;
+            }
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1215,10 +1488,98 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
+    // one folded graph: re-inject [n - fold_n_inj, n) + the 5-row block at [n, n+5); returns false if not possible
+    bool draft_fold(common_speculative_draft_params_vec & dparams) {
+        auto & dp = dparams[0];
+        auto * ctx_dft = params.ctx_dft;
+        const llama_pos n  = (llama_pos) dp.n_past;
+        const llama_pos w0 = n - fold_n_inj;
+        if (w0 < 0) {
+            return false;
+        }
+        for (llama_pos p = w0; p < n; ++p) {
+            if (fold_feat.find(p) == fold_feat.end()) {
+                return false;
+            }
+        }
+        // everything before the window must already be in the cache
+        if (fold_injected_upto + 1 < w0 && !fold_inject_range(0, fold_injected_upto + 1, w0)) {
+            return false;
+        }
+        // the window is re-injected: drop whatever the cache holds from w0 on (stale / rejected rows)
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, w0, -1);
+        if (dsv41_window > 0 && n > dsv41_window) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, n - dsv41_window);
+        }
+
+        const int32_t n_blk = block_size;
+        batch_inject.n_tokens = fold_n_inj + n_blk;
+        for (int32_t i = 0; i < fold_n_inj; ++i) {
+            memcpy(batch_inject.embd + (size_t) i*n_embd_enc, fold_feat[w0 + i].data(), (size_t) n_embd_enc*sizeof(float));
+            batch_inject.pos[i] = w0 + i;
+            batch_inject.n_seq_id[i] = 1;
+            batch_inject.seq_id[i][0] = 0;
+            batch_inject.logits[i] = false;
+        }
+        for (int32_t i = 0; i < n_blk; ++i) {
+            const int32_t r = fold_n_inj + i;
+            float * row = batch_inject.embd + (size_t) r*n_embd_enc;
+            memset(row, 0, (size_t) n_embd_enc*sizeof(float));
+            row[0] = (float) (i == 0 ? dp.id_last : mask_token_id);
+            batch_inject.pos[r] = n + i;
+            batch_inject.n_seq_id[r] = 1;
+            batch_inject.seq_id[r][0] = 0;
+            batch_inject.logits[r] = true;
+        }
+        const int64_t t0 = profile ? ggml_time_us() : 0;
+        if (llama_decode(ctx_dft, batch_inject) != 0) {
+            LOG_WRN("%s: folded DSpark decode failed\n", __func__);
+            return false;
+        }
+        fold_injected_upto = n - 1;
+        if (profile) {
+            llama_synchronize(ctx_dft);
+            SPC_INF("DSPARK_PROFILE stage=graph n_tokens=%d time_us=%" PRId64 " (folded)\n", batch_inject.n_tokens, ggml_time_us() - t0);
+        }
+
+        auto & result = *dp.result;
+        const int32_t n_draft = std::min<int32_t>(params.n_max, n_blk);
+        auto * smpl = smpls[0].get();
+        common_sampler_reset(smpl);
+        for (int32_t i = 0; i < n_draft; ++i) {
+            const int32_t idx = fold_n_inj + i; // batch index of block row i
+            if (host_markov) {
+                const llama_token prev = result.empty() ? dp.id_last : result.back();
+                result.push_back(host_markov_pick(llama_get_logits_ith(ctx_dft, idx), prev));
+                continue;
+            }
+            common_sampler_sample(smpl, ctx_dft, idx, true);
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+            const llama_token id = cur_p->data[0].id;
+            common_sampler_accept(smpl, id, true);
+            result.push_back(id);
+        }
+        if (result.size() < (size_t) params.n_min) {
+            result.clear();
+        }
+        return true;
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
+
+        if (fold && dparams[0].drafting) {
+            if (draft_fold(dparams)) {
+                return;
+            }
+            // not possible (no features yet): make the cache complete and take the unfolded path
+            const llama_pos n = (llama_pos) dparams[0].n_past;
+            if (fold_injected_upto + 1 < n && !fold_inject_range(0, fold_injected_upto + 1, n)) {
+                LOG_WRN("%s: DSpark fold: missing target features, drafting without them\n", __func__);
+            }
+        }
 
         // build one batch holding every drafting sequence's noise block into a single decode)
         // record where each block starts and its size
@@ -1235,12 +1596,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
+            if (dsv41_window > 0 && n > dsv41_window) {
+                // keep exactly the reference ring: committed positions [n - window, n)
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, 0, n - dsv41_window);
+            }
+
             const int32_t n_draft = params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            // V4.1 DSpark is trained on full blocks of block_size rows whose noise positions attend to each
+            // other; a shorter block changes every prediction. Decode the full block (also a draft-length
+            // independent graph) and read only the first n_draft positions.
+            static const bool full_block_env = !std::getenv("LLAMA_DSPARK_FULL_BLOCK") || std::atoi(std::getenv("LLAMA_DSPARK_FULL_BLOCK")) != 0;
+            const int32_t n_block_rows = dsv41_window > 0 && full_block_env ? std::max(n_block_tokens, block_size) : n_block_tokens;
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
+            for (int32_t i = 0; i < n_block_rows; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
             }
         }
@@ -1339,6 +1710,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (params.p_min > 0.0f && conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
                         cutoff = i - i_draft_beg;
                         break;
+                    }
+
+                    if (host_markov) {
+                        const llama_token prev = result.empty() ? dp.id_last : result.back();
+                        const int64_t t_hm = profile ? ggml_time_us() : 0;
+                        const float * lg = llama_get_logits_ith(ctx_dft, idx);
+                        const int64_t t_hm1 = profile ? ggml_time_us() : 0;
+                        result.push_back(host_markov_pick(lg, prev));
+                        if (profile) {
+                            SPC_INF("DSPARK_PROFILE stage=host_markov i=%d get_logits_us=%" PRId64 " pick_us=%" PRId64 "\n",
+                                    i, t_hm1 - t_hm, ggml_time_us() - t_hm1);
+                        }
+                        continue;
                     }
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -3242,7 +3626,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
             params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        // DeepSeek-V4.1 DSpark always decodes its full trained block (5 rows) whatever n_max is: reserve up to 8
+        const bool has_dspark = std::find(
+            params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+        const int32_t per_seq = std::max(has_dspark ? 8 : 1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
@@ -3252,7 +3640,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // batch. Keep this independent from the target ubatch: a small target
         // ubatch is useful for stateful models and must not make DFlash/DSpark
         // abort while decoding their noise block.
-        const int32_t block_tokens = std::max(1, params_spec.n_max + (has_dflash ? 1 : 0));
+        const int32_t block_tokens = std::max(has_dspark ? 8 : 1, params_spec.n_max + (has_dflash ? 1 : 0));
         result.n_ubatch = std::max(result.n_ubatch, block_tokens);
     }
 

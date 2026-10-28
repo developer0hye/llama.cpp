@@ -1749,3 +1749,15 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// DeepSeek-V4.1 speculative verification: batch-invariant small batches (GGML_CUDA_DSV41_BI=1).
+// When set, every matmul with <= MMVQ_MAX_BATCH_SIZE columns computes each column with exactly the
+// arithmetic of the single-column (decode) path, so a K+1 verification batch reproduces the logits of
+// K+1 sequential decode steps bit for bit. See ~/dsv41/dspark/NOTES.md.
+static inline bool ggml_cuda_dsv41_bi() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_DSV41_BI");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return enabled;
+}

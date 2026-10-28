@@ -155,7 +155,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
         return mask == nullptr && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
             Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[2] % K->ne[2] == 0 && gqa_ratio > 4 &&
             indices->type == GGML_TYPE_I32 && indices->ne[1] == Q->ne[1] && indices->ne[2] == Q->ne[3] &&
-            K->ne[1] >= std::max<int64_t>(4096, 2LL*indices->ne[0]);
+            (ggml_cuda_dsv41_bi() || K->ne[1] >= std::max<int64_t>(4096, 2LL*indices->ne[0]));
     }
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
@@ -167,10 +167,13 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
         (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1);
     const int64_t n_gather = n_queries_gathered * (int64_t) n_kv_max;
 
+    // batch-invariant mode: the dense/sparse choice must not depend on the KV length (a verification batch
+    // sees a longer padded KV than the decode step of its first row), so take the sparse kernel whenever it applies.
+    const bool long_enough = ggml_cuda_dsv41_bi() || K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+        long_enough;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -769,6 +772,42 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    {
+        // batch-invariant small batches (GGML_CUDA_DSV41_BI): run every query through the single-query
+        // configuration, so a verification batch reproduces the decode-step attention bit for bit.
+        const ggml_tensor * Q = dst->src[0];
+        if (ggml_cuda_dsv41_bi() && Q->ne[1] > 1 && Q->ne[1] <= 8 && Q->ne[3] == 1) {
+            const ggml_tensor * mask = dst->src[3];
+            const ggml_tensor * idx  = dst->src[5];
+            for (int64_t t = 0; t < Q->ne[1]; ++t) {
+                ggml_tensor Q_t = *Q;
+                Q_t.ne[1] = 1;
+                Q_t.data  = (char *) Q->data + t*Q->nb[1];
+                ggml_tensor mask_t;
+                if (mask) {
+                    mask_t = *mask;
+                    mask_t.ne[1] = 1;
+                    mask_t.data  = (char *) mask->data + t*mask->nb[1];
+                }
+                ggml_tensor idx_t;
+                if (idx) {
+                    GGML_ASSERT(idx->ne[1] == Q->ne[1]);
+                    idx_t = *idx;
+                    idx_t.ne[1] = 1;
+                    idx_t.data  = (char *) idx->data + t*idx->nb[1];
+                }
+                ggml_tensor dst_t = *dst;
+                dst_t.ne[2]  = 1;
+                dst_t.data   = (char *) dst->data + t*dst->nb[2];
+                dst_t.src[0] = &Q_t;
+                dst_t.src[3] = mask ? &mask_t : nullptr;
+                dst_t.src[5] = idx  ? &idx_t  : nullptr;
+                ggml_cuda_flash_attn_ext(ctx, &dst_t);
+            }
+            return;
+        }
+    }
     if (dst->src[5] != nullptr) {
         if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

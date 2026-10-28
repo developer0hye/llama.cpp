@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -948,7 +949,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+    // V4 normalizes q again per head after wq_b. V4.1 (and its DSpark stages, reference
+    // DSparkAttention) normalizes only the low-rank qr. Applying the V4 norm to a V4.1 DSpark
+    // stage rescales every attention logit of the drafter (LLAMA_DSPARK_LEGACY_QNORM=1 restores
+    // the old behaviour for A/B).
+    static const bool legacy_qnorm = getenv("LLAMA_DSPARK_LEGACY_QNORM") && atoi(getenv("LLAMA_DSPARK_LEGACY_QNORM")) != 0;
+    if (!hparams.dflash_dsv41_semantics || legacy_qnorm) {
+        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+    }
     cb(q, "q_norm", il);
 
     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,

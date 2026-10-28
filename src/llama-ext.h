@@ -130,6 +130,9 @@ LLAMA_API struct ggml_tensor * llama_get_embeddings_nextn_tensor(struct llama_co
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// DeepSeek-V4.1 DSpark: fold KV injection of n_inj target-feature rows and the draft block into one graph
+LLAMA_API void llama_set_dspark_fold(struct llama_context * ctx, uint32_t n_inj);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
