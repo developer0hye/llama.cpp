@@ -3805,7 +3805,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_down_reduction_match match;
         if (ggml_cuda_dsv41_match_moe_down(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+            const bool memory_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1);
+            if (getenv("DSV41_MOE_TRACE")) {
+                static thread_local unsigned seen[64] = {};
+                const char * suffix = strrchr(node->name, '-');
+                const int layer = suffix ? atoi(suffix + 1) : 0;
+                const unsigned bit = 1u << (2*match.input->ne[2] + (memory_ok ? 1 : 0));
+                if (layer >= 0 && layer < 64 && !(seen[layer] & bit)) {
+                    seen[layer] |= bit;
+                    GGML_LOG_INFO("dsv41_moe_trace: device=%d nt=%lld memory_ok=%d node=%s\n",
+                            cuda_ctx->device, (long long) match.input->ne[2], memory_ok, node->name);
+                    if (!memory_ok) {
+                        for (int j = i; j < i + match.node_count; ++j) {
+                            for (const ggml_tensor * src : cgraph->nodes[j]->src) {
+                                if (!src || src->op == GGML_OP_NONE) { continue; }
+                                const uintptr_t begin = (uintptr_t) src->data;
+                                const uintptr_t end = begin + ggml_backend_buft_get_alloc_size(src->buffer->buft, src);
+                                const uintptr_t out_begin = (uintptr_t) match.dst->data;
+                                const uintptr_t out_end = out_begin + ggml_backend_buft_get_alloc_size(match.dst->buffer->buft, match.dst);
+                                if (begin < out_end && out_begin < end) {
+                                    bool internal = false;
+                                    for (int k = i; k < j; ++k) { internal |= cgraph->nodes[k] == src; }
+                                    if (!internal) {
+                                        GGML_LOG_INFO("dsv41_moe_overlap: nt=%lld node=%s src=%s src_bytes=%zu dst_bytes=%zu offset=%lld\n",
+                                                (long long) match.input->ne[2], node->name, src->name,
+                                                (size_t) (end - begin), (size_t) (out_end - out_begin),
+                                                (long long) ((int64_t) out_begin - (int64_t) begin));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (memory_ok) {
                 dsv41_moe_down_args a{};
                 a.w = match.matrix->data; a.expert_stride = match.matrix->nb[2]; a.w_shared = nullptr;
                 a.act = (const float *) match.input->data; a.act_shared = nullptr;

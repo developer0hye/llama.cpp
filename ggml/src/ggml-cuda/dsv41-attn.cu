@@ -219,9 +219,9 @@ void ggml_cuda_op_dsv41_attn_decode(ggml_backend_cuda_context & ctx, ggml_tensor
     a.n_chunk = (a.n_raw + a.n_top + DSV41_ATTN_CH - 1) / DSV41_ATTN_CH;
     a.scale = ggml_get_op_params_f32(dst, 0);
     {
-        static int n_dbg = getenv("DSV41_ATTN_DEBUG") ? 4 : 0;
-        if (n_dbg > 0) {
-            n_dbg--;
+        static thread_local unsigned debug_seen = 0;
+        if (getenv("DSV41_ATTN_DEBUG") && a.NT <= 8 && !(debug_seen & (1u << a.NT))) {
+            debug_seen |= 1u << a.NT;
             GGML_LOG_INFO("dsv41_attn_decode: H=%d NT=%d NS=%d n_raw=%d n_top=%d n_chunk=%d\n", a.H, a.NT, NS, a.n_raw, a.n_top, a.n_chunk);
         }
     }

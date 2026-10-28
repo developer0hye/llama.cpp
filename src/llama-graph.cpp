@@ -1033,6 +1033,23 @@ static bool dsv4_can_reuse_comp_input(
             inp.candidate_pin->ne[1] == (int64_t) n_tokens/n_stream &&
             inp.candidate_pin->ne[2] == 1 && inp.candidate_pin->ne[3] == n_stream;
 
+    if (!res && n_tokens <= 8 && getenv("DSV41_SHAPE_DEBUG")) {
+        const auto check = [&](const char * label, ggml_tensor * t, size_t size) {
+            const int64_t old = t ? t->ne[0] : 0;
+            if (old != (int64_t) size) {
+                LLAMA_LOG_INFO("dsv41_shape: %s %s %lld -> %zu nt=%u\n",
+                        inp.state_pos ? inp.state_pos->name : "none", label,
+                        (long long) old, size, n_tokens);
+            }
+        };
+        check("persist", inp.state_persist_src_idxs, plan.state_persist_src_idxs.size());
+        check("restore", inp.state_restore_src_idxs, plan.state_restore_src_idxs.size());
+        check("snapshot", inp.state_snapshot_src_idxs, plan.state_snapshot_src_idxs.size());
+        check("read", inp.state_read_idxs, plan.state_read_idxs.size());
+        check("write", inp.state_write_idxs, plan.state_write_idxs.size());
+        check("kv", inp.kq_mask, plan.n_kv);
+        check("candidate", inp.candidate_pin, n_candidate_blocks);
+    }
     return res;
 }
 

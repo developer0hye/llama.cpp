@@ -256,8 +256,19 @@ int main(int argc, char ** argv) {
     std::mt19937 rng(1234);
     llama_batch bt = llama_batch_init(std::max(n_batch, K + 2), 0, 1);
 
+    int failed_reports = 0;
     for (size_t ip = 0; ip < prompts.size(); ++ip) {
-        const auto p = common_tokenize(ctx, prompts[ip], true, true);
+        auto p = common_tokenize(ctx, prompts[ip], true, true);
+        const int target_length = env_int("DSC_PROMPT_TARGET", 0);
+        if (target_length > 0) {
+            if (target_length < 128 || p.size() < (size_t) target_length) {
+                LOG_ERR("prompt is too short for DSC_PROMPT_TARGET\n");
+                return 1;
+            }
+            const std::vector<llama_token> suffix(p.end() - 64, p.end());
+            p.resize(target_length - 64);
+            p.insert(p.end(), suffix.begin(), suffix.end());
+        }
         LOG_INF("\n===== prompt %zu: %zu tokens\n", ip, p.size());
         const int n0 = (int) p.size() - 1; // position of id_last
 
@@ -288,6 +299,9 @@ int main(int argc, char ** argv) {
         const int NR = (int) ref.toks.size();
 
         auto report = [&](const char * name, const cmp_stats & st, int n_emit, double dt, int n_pass, int n_drafted, int n_acc) {
+            if (n_emit != NR || st.n_argmax_diff || (env_int("DSC_REQUIRE_EXACT", 0) && st.max_diff != 0)) {
+                ++failed_reports;
+            }
             LOG_INF("[%s] emitted %d/%d, identical_prefix=%d, argmax_diff_rows=%d, max|dlogit|=%.4g, mean max|dlogit|=%.4g, "
                     "KL mean=%.3g max=%.3g, passes=%d, drafted=%d, accepted=%d (%.1f%%), acc/pass=%.2f, %.2f tok/s, %.1f ms/pass\n",
                     name, n_emit, NR, st.first_div < 0 ? n_emit : st.first_div, st.n_argmax_diff, st.max_diff,
@@ -425,6 +439,8 @@ int main(int argc, char ** argv) {
             llama_token last = p.back();
             int i = 0; // number of emitted tokens == ref index of the next token
             cmp_stats st; int n_pass = 0, n_drafted = 0, n_acc = 0, cyc = 0;
+            std::vector<double> decode_ms;
+            double decode_total_ms = 0;
             const double t0 = now_s();
             while (i < NR && st.first_div < 0) {
                 const int k = std::min(K, NR - i - 1);
@@ -436,7 +452,12 @@ int main(int argc, char ** argv) {
                 common_batch_clear(bt);
                 common_batch_add(bt, last, n0 + i, { 0 }, true);
                 for (int j = 0; j < (int) draft.size(); ++j) common_batch_add(bt, draft[j], n0 + i + 1 + j, { 0 }, true);
+                const double decode_start = now_s();
                 if (llama_decode(ctx, bt)) { LOG_ERR("decode failed\n"); exit(1); }
+                llama_synchronize(ctx);
+                const double decode_dt = 1000.0 * (now_s() - decode_start);
+                decode_total_ms += decode_dt;
+                if (n_pass >= 3 && k == K) decode_ms.push_back(decode_dt);
                 n_pass++; n_drafted += draft.size();
                 int j = 0;
                 for (;; ++j) {
@@ -452,12 +473,25 @@ int main(int argc, char ** argv) {
                 llama_memory_seq_rm(llama_get_memory(ctx), 0, n0 + i, -1);
             }
             report(name, st, i, now_s() - t0, n_pass, n_drafted, n_acc);
+            std::sort(decode_ms.begin(), decode_ms.end());
+            LOG_INF("VERIFY_TIME name=%s width=%d samples=%zu total_ms=%.3f median_ms=%.3f min_ms=%.3f\n",
+                    name, K + 1, decode_ms.size(), decode_total_ms,
+                    decode_ms.empty() ? 0 : decode_ms[decode_ms.size()/2], decode_ms.empty() ? 0 : decode_ms.front());
         };
         if (want("full")) run_verify("full", false, K);
         if (want("rb"))   run_verify("rb",   true, K);
         if (want("ksweep")) {
             // verification cost per pass vs batch width (oracle drafts, all accepted)
-            for (int k = 0; k <= K; ++k) {
+            std::vector<int> sweep;
+            std::stringstream selected(env_str("DSC_K_LIST", ""));
+            std::string item;
+            while (std::getline(selected, item, ',')) {
+                const int k = std::stoi(item);
+                if (k < 0 || k > K) { LOG_ERR("invalid DSC_K_LIST\n"); return 1; }
+                sweep.push_back(k);
+            }
+            if (sweep.empty()) for (int k = 0; k <= K; ++k) sweep.push_back(k);
+            for (int k : sweep) {
                 const std::string nm = "ksweep k=" + std::to_string(k);
                 run_verify(nm.c_str(), false, k);
             }
@@ -533,5 +567,6 @@ int main(int argc, char ** argv) {
     llama_batch_free(bt);
     if (spec) common_speculative_free(spec);
     llama_backend_free();
-    return 0;
+    LOG_INF("CHECK_RESULT failed_reports=%d\n", failed_reports);
+    return failed_reports ? 2 : 0;
 }
