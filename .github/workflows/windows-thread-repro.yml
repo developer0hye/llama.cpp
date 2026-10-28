@@ -36,8 +36,12 @@ jobs:
       - name: Build unchanged upstream source
         shell: pwsh
         run: |
-          cmake -S . -B build -G "Ninja Multi-Config" -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS "-DBLAS_INCLUDE_DIRS=$env:RUNNER_TEMP/openblas/include" "-DBLAS_LIBRARIES=$env:RUNNER_TEMP/openblas/lib/openblas.lib" -DLLAMA_BUILD_BORINGSSL=ON
+          choco install ninja --yes --no-progress
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake -S . -B build -G "Ninja Multi-Config" "-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake" -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS "-DBLAS_INCLUDE_DIRS=$env:RUNNER_TEMP/openblas/include" "-DBLAS_LIBRARIES=$env:RUNNER_TEMP/openblas/lib/openblas.lib" -DLLAMA_BUILD_BORINGSSL=ON
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS --target test-thread-safety
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Copy-Item "$env:RUNNER_TEMP/openblas/bin/libopenblas.dll" build/bin/Release/openblas.dll
       - name: Repeat thread safety test
         shell: pwsh
