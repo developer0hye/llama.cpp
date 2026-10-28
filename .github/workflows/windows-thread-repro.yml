@@ -1,0 +1,53 @@
+name: Windows thread safety reproduction
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/windows-thread-repro]
+
+permissions:
+  contents: read
+
+jobs:
+  openblas:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      GGML_NLOOP: 3
+      GGML_N_THREADS: 1
+      GGML_SCHED_DEBUG_REALLOC: 1
+      OPENBLAS_VERSION: 0.3.23
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 8ca4060b7e30e76baaa5670ee1ec1b760b7f8552
+      - name: Prepare OpenBLAS
+        shell: pwsh
+        run: |
+          clang --version
+          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors
+          curl.exe --fail -L -o "$env:RUNNER_TEMP/openblas.zip" "https://github.com/xianyi/OpenBLAS/releases/download/v${env:OPENBLAS_VERSION}/OpenBLAS-${env:OPENBLAS_VERSION}-x64.zip"
+          New-Item -ItemType Directory "$env:RUNNER_TEMP/openblas"
+          tar.exe -xf "$env:RUNNER_TEMP/openblas.zip" -C "$env:RUNNER_TEMP/openblas"
+          $vcdir = vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $version = (Get-Content -Raw (Join-Path $vcdir 'VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt')).Trim()
+          $lib = Join-Path $vcdir "VC/Tools/MSVC/$version/bin/Hostx64/x64/lib.exe"
+          & $lib /machine:x64 "/def:$env:RUNNER_TEMP/openblas/lib/libopenblas.def" "/out:$env:RUNNER_TEMP/openblas/lib/openblas.lib" /name:openblas.dll
+      - name: Build unchanged upstream source
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS "-DBLAS_INCLUDE_DIRS=$env:RUNNER_TEMP/openblas/include" "-DBLAS_LIBRARIES=$env:RUNNER_TEMP/openblas/lib/openblas.lib" -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS --target test-thread-safety
+          Copy-Item "$env:RUNNER_TEMP/openblas/bin/libopenblas.dll" build/bin/Release/openblas.dll
+      - name: Repeat thread safety test
+        shell: pwsh
+        run: |
+          ctest --test-dir build -R '^test-thread-safety$' -C Release --verbose --repeat until-fail:5 --timeout 180
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: windows-thread-repro-logs
+          path: |
+            build/Testing/Temporary/*.log
+            build/CMakeCache.txt
+            build/CMakeFiles/CMakeConfigureLog.yaml
