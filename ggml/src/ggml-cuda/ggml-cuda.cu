@@ -1911,6 +1911,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+    if (ggml_cuda_dsv41_bi()) {
+        // batch-invariant verification: the fused GLU/bias epilogue exists only for 1 column, so a decode
+        // step and a verification row would round differently. Keep both on the unfused path.
+        return false;
+    }
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1938,6 +1943,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+    if (ggml_cuda_dsv41_bi()) {
+        // batch-invariant verification: the fused GLU/bias epilogue exists only for 1 column, so a decode
+        // step and a verification row would round differently. Keep both on the unfused path.
+        return false;
+    }
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1986,6 +1996,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    if (ggml_cuda_dsv41_bi() && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+        // batch-invariant: the single-column kernels, one accumulation order for every column count
+        if (ggml_is_quantized(src0->type)) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+        if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, 1)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+    }
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
@@ -2070,7 +2092,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                const int mmvq_mmid_max = ggml_cuda_dsv41_bi() ? MMVQ_MAX_BATCH_SIZE : get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -3322,6 +3344,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     // prefill and speculative verification batches.
     if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
             (n_tokens <= 1 && !allow_single_token)) {
+        return false;
+    }
+    if (ggml_cuda_dsv41_bi() && !allow_single_token && n_tokens <= 8) {
+        // batch-invariant verification: keep the decode-step chain of adds
         return false;
     }
 

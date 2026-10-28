@@ -117,6 +117,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_nextn_host(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_dspark_fold(uint32_t n_inj);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_index_reuse(bool reuse);
     bool mtp_device_draft_begin(uint32_t n_steps);

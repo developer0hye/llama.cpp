@@ -1151,7 +1151,12 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        if(use_stream_k) {
+        if (ggml_cuda_dsv41_bi() && Q->ne[1] == 1) {
+            // batch-invariant decode/verification: one CUDA block walks the whole KV range of its output tile
+            // in order, no stream-k split and no fixup. The result then does not depend on the KV length or on
+            // the sparse gather width: trailing masked / absent tiles are exact no-ops of the online softmax.
+            blocks_num.x = ntiles_dst;
+        } else if(use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
             // Only do this if the occupancy loss from rounding is acceptable.

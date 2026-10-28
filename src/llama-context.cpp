@@ -4428,6 +4428,15 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
     ctx->set_embeddings_layer_inp(lid, value);
 }
 
+void llama_context::set_dspark_fold(uint32_t n_inj) {
+    cparams.dspark_fold_n_inj = n_inj;
+    sched_need_reserve = true;
+}
+
+void llama_set_dspark_fold(llama_context * ctx, uint32_t n_inj) {
+    ctx->set_dspark_fold(n_inj);
+}
+
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }

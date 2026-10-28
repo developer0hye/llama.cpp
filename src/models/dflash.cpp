@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -68,6 +70,15 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         }
 
         GGML_ASSERT(hparams.n_swa > 0);
+        const char * exact_env = getenv("LLAMA_DSPARK_EXACT_WINDOW"); // =0: original fork mask (A/B only)
+        if (hparams.dflash_dsv41_semantics && hparams.dflash_block_size > 0 && !(exact_env && atoi(exact_env) == 0)) {
+            // Reference DSparkAttention: every query of the draft block sees the whole ring of the
+            // last `window` committed main-KV rows plus the block itself. A position-difference SWA
+            // mask of width `window` would hide the oldest j rows from block position j, so widen the
+            // mask by the block size; the speculative driver trims the cache to exactly `window`
+            // committed rows before each draft (common/speculative.cpp, draft-dspark).
+            hparams.n_swa += hparams.dflash_block_size;
+        }
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         hparams.set_swa_pattern(0);
         for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
@@ -293,7 +304,7 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, int64_t n_blocks_override = 0) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -318,7 +329,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const bool sample_from_anchor = it_anchor == model.gguf_kv.end() || it_anchor->second == "true";
     const int64_t i_draft_beg    = sample_from_anchor ? 0 : 1;
 
-    const int64_t n_blocks = g.ubatch.n_seqs_unq;
+    const int64_t n_blocks = n_blocks_override > 0 ? n_blocks_override : (int64_t) g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tok % n_blocks == 0 && "DSpark markov head requires equal-size blocks");
     // runtime tokens per block in this ubatch (anchor + drafted positions), bounded by training block_size
     const int64_t block_drafts = n_tok / n_blocks;
@@ -843,8 +854,13 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
 
+    const uint32_t n_fold_inj = cparams.dspark_fold_n_inj;
+    const int64_t  n_fold_blk = hparams.dflash_block_size;
+    const bool     is_fold    = ubatch.embd && n_fold_inj > 0 && hparams.dflash_dsv41_semantics &&
+                                n_tokens == (int64_t) n_fold_inj + n_fold_blk;
+
     // KV cache injection: fused target features from the encoder
-    if (ubatch.embd) {
+    if (ubatch.embd && !is_fold) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
@@ -886,6 +902,26 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         return;
     }
 
+    // Folded DeepSeek-V4.1 DSpark step (one graph per speculative cycle, see common/speculative.cpp):
+    //   rows [0, n_inj)        target features -> main-track K of each stage, written into the ring
+    //   rows [n_inj, n_tokens) the noise block; its token ids travel in column 0 of the embd rows
+    // Every row gets a cache write (the KV slots cover the whole ubatch); only block rows run the stages.
+    ggml_tensor * fold_feat = nullptr;
+    ggml_tensor * fold_ids  = nullptr;
+    if (is_fold) {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+        ggml_set_input(inp->embd);
+        ggml_tensor * all = inp->embd;
+        res->add_input(std::move(inp));
+
+        fold_feat = ggml_view_2d(ctx0, all, n_embd_inp, n_fold_inj, all->nb[1], 0);
+        fold_ids  = ggml_view_2d(ctx0, all, 1, n_fold_blk, all->nb[1], (size_t) n_fold_inj*all->nb[1]);
+        fold_ids  = ggml_cast(ctx0, ggml_cont(ctx0, fold_ids), GGML_TYPE_I32);
+        fold_ids  = ggml_reshape_1d(ctx0, fold_ids, n_fold_blk);
+        cb(fold_ids, "fold_ids", -1);
+    }
+
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
     if (tok_embd == nullptr) {
@@ -896,21 +932,94 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         tok_embd = model_other->tok_embd;
     }
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    // block rows: the whole ubatch, or the tail of a folded step
+    const int64_t n_rows = is_fold ? n_fold_blk : n_tokens;
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
+    ggml_tensor * inp_tokens = nullptr;
+    if (is_fold) {
+        inp_tokens = fold_ids;
+    } else {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-    ggml_tensor * inp_tokens = inp->tokens;
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        inp_tokens = inp->tokens;
+        res->add_input(std::move(inp));
+    }
+
+    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
     cb(inpL, "inp_noise_embd", -1);
 
-    res->add_input(std::move(inp));
+    // folded step: positions of the feature rows / block rows, and each stage's main-track K for the
+    // feature rows (same math as the injection branch above)
+    ggml_tensor * pos_blk = is_fold ? ggml_view_1d(ctx0, inp_pos, n_fold_blk, (size_t) n_fold_inj*ggml_element_size(inp_pos)) : inp_pos;
+    std::vector<ggml_tensor *> fold_kv(n_layer, nullptr);
+    if (is_fold) {
+        ggml_tensor * pos_inj = ggml_view_1d(ctx0, inp_pos, n_fold_inj, 0);
+        ggml_tensor * inp_g = build_lora_mm(model.fc, fold_feat, model.fc_s);
+        inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor * kv = build_lora_mm(model.layers[il].wkv, inp_g);
+            kv = build_norm(kv, model.layers[il].attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+            kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, n_fold_inj);
+            kv = ggml_rope_ext(ctx0, kv, pos_inj, nullptr, n_embd_head_rope, rope_type, 0,
+                    freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            kv = ggml_rope_set_offset(kv, n_embd_head_nope);
+            cb(kv, "fold_kv_inj", il);
+            fold_kv[il] = kv;
+        }
+    }
+
+    // DeepSeek-V4.1 attention of the block rows in a folded step: the cache write covers every ubatch row,
+    // so the injected main-track K is concatenated in front of the block K, with zero (discarded) queries.
+    auto build_fold_attention = [&](ggml_tensor * cur, int il) -> ggml_tensor * {
+        const auto & layer = model.layers[il];
+        const int64_t n_groups     = hparams.dsv4_o_group_count;
+        const int64_t o_lora_rank  = hparams.dsv4_o_lora_rank;
+        const int64_t o_group_dim  = (n_head/n_groups)*n_embd_head;
+
+        ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
+        qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
+        q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, n_fold_blk);
+        q = ggml_rope_ext(ctx0, q, pos_blk, nullptr, n_embd_head_rope, rope_type, 0,
+                freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        q = ggml_rope_set_offset(q, n_embd_head_nope);
+
+        ggml_tensor * kv = build_lora_mm(layer.wkv, cur);
+        kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+        kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, n_fold_blk);
+        kv = ggml_rope_ext(ctx0, kv, pos_blk, nullptr, n_embd_head_rope, rope_type, 0,
+                freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        kv = ggml_rope_set_offset(kv, n_embd_head_nope);
+
+        ggml_tensor * kv_all = ggml_concat(ctx0, fold_kv[il], kv, 2);
+        ggml_tensor * q_pad  = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd_head, n_head, n_fold_inj), 0.0f);
+        ggml_tensor * q_all  = ggml_concat(ctx0, q_pad, q, 2);
+        cb(kv_all, "fold_kv_all", il);
+
+        ggml_tensor * out = build_attn(inp_attn, nullptr, nullptr, nullptr,
+                q_all, kv_all, kv_all, nullptr, layer.attn_sinks, nullptr,
+                1.0f/sqrtf(float(n_embd_head)), il);
+        // [n_embd_head*n_head, n_tokens] -> block rows
+        out = ggml_view_2d(ctx0, out, out->ne[0], n_fold_blk, out->nb[1], (size_t) n_fold_inj*out->nb[1]);
+        out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, out), n_embd_head, n_head, n_fold_blk);
+        out = ggml_rope_ext_back(ctx0, out, pos_blk, nullptr, n_embd_head_rope, rope_type, 0,
+                freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        out = ggml_rope_set_offset(out, n_embd_head_nope);
+
+        out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, n_fold_blk);
+        out = ggml_permute(ctx0, out, 0, 2, 1, 3);
+        ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+        oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+        oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, n_fold_blk);
+        return build_lora_mm(layer.wo_b, oa);
+    };
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_rows);
+    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_rows, 1);
     cb(inpL, "hc_init", -1);
 
     // V4.1 uses a one-sublayer lag: every sublayer produces the mix consumed by
@@ -918,10 +1027,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     ggml_tensor * pre_mix = nullptr;
     if (hparams.dflash_dsv41_semantics) {
         pre_mix = ggml_fill(ctx0,
-                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens), 1.0f);
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_rows), 1.0f);
         if (hc > 1) {
             pre_mix = ggml_concat(ctx0, pre_mix,
-                    ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
+                    ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_rows), 0.0f), 0);
         }
         cb(pre_mix, "hc_pre_init", -1);
     }
@@ -952,7 +1061,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention(model, inp_attn, cur, inp_pos, il);
+        cur = is_fold ? build_fold_attention(cur, il) : build_attention(model, inp_attn, cur, inp_pos, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
@@ -1037,7 +1146,11 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     ggml_build_forward_expand(gf, cur);
 
-    if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+    // LLAMA_DSPARK_HOST_MARKOV=1: the semi-autoregressive Markov chain runs on the host
+    // (common/speculative.cpp); needed under -sm tensor, where the vocab-split logits cannot take the
+    // in-graph bias + argmax. The pre-norm hidden is exported for a host-side confidence head.
+    static const bool host_markov = getenv("LLAMA_DSPARK_HOST_MARKOV") && atoi(getenv("LLAMA_DSPARK_HOST_MARKOV")) != 0;
+    if (model.dspark_markov_w1 && !host_markov) {
+        build_dspark_markov_head(*this, model, inp_tokens, is_fold ? 1 : 0);
     }
 }
