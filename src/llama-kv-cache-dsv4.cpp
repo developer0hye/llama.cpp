@@ -469,10 +469,14 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
 
     std::map<std::pair<llama_seq_id, llama_pos>, int64_t> curr_token_idx_map;
     std::map<llama_seq_id, uint32_t> state_write_counts;
+    std::map<llama_seq_id, uint32_t> seq_token_counts;
 
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
             curr_token_idx_map[std::make_pair(ubatch.seq_id[i][s], ubatch.pos[i])] = i;
+            if (ubatch.pos[i] >= 0) {
+                ++seq_token_counts[ubatch.seq_id[i][s]];
+            }
         }
     }
 
@@ -610,9 +614,13 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     // parallelism, forces an eager step every other call. Pad every sequence to the maximum block count of
     // this ubatch size with dummy blocks that write to the last (masked, never live) cache slot.
     if (!overlap && !plan.state_pos.empty() && ratio > 1 && !dsv4_ubatch_has_coupled(ubatch) && plan.n_kv < (int64_t) kv_size) {
-        const uint32_t n_blocks = (std::max<uint32_t>(1, ubatch.n_seq_tokens) + ratio - 1)/ratio;
+        static const bool verify_pad = getenv("LLAMA_DSV41_VERIFY_PAD") && atoi(getenv("LLAMA_DSV41_VERIFY_PAD")) != 0;
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+            // split_simple() has n_seq_tokens == 1 even when several tokens belong
+            // to the same sequence. Count those tokens before padding its writes.
+            const uint32_t n_tokens = verify_pad ? seq_token_counts[seq_id] : ubatch.n_seq_tokens;
+            const uint32_t n_blocks = (std::max<uint32_t>(1, n_tokens) + ratio - 1)/ratio;
             uint32_t i = 0;
             while (i < ubatch.n_tokens && (ubatch.pos[i] < 0 || !dsv4_token_has_seq(ubatch, i, seq_id))) {
                 ++i;
