@@ -2515,6 +2515,53 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+// Private TP8 experiment: preserve inputs of the CUDA DSV41 down fusion in
+// the outer allocation graph. Device optimizers do not extend these lifetimes
+// through the meta backend before its outer allocation is assigned.
+static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, ggml_cgraph * graph,
+        ggml_backend_graph_optimize_params * params) {
+    static const bool enabled = getenv("LLAMA_DSV41_MOE_META_DEPS") &&
+            atoi(getenv("LLAMA_DSV41_MOE_META_DEPS")) != 0;
+    if (!enabled || ggml_backend_meta_n_backends(backend) != 8) {
+        return;
+    }
+    for (int i = 0; i + 12 < graph->n_nodes; ++i) {
+        ggml_tensor * mm = graph->nodes[i];
+        if (mm->op != GGML_OP_MUL_MAT_ID) { continue; }
+        ggml_tensor * matrix = mm->src[0];
+        ggml_tensor * input = mm->src[1];
+        ggml_tensor * ids = mm->src[2];
+        if (matrix->type != GGML_TYPE_MXFP4 || matrix->ne[0] != 2304 || matrix->ne[1] != 5120 ||
+                input->type != GGML_TYPE_F32 || input->ne[0] != 2304 || input->ne[1] != 6 ||
+                input->ne[2] < 1 || input->ne[2] > 8 || input->ne[3] != 1 ||
+                ids->type != GGML_TYPE_I32 || ids->ne[0] != 6) { continue; }
+        ggml_tensor * weighted = graph->nodes[i + 1];
+        if (weighted->op != GGML_OP_MUL || weighted->src[0] != mm) { continue; }
+        ggml_tensor * weights = weighted->src[1];
+        if (weights->type != GGML_TYPE_F32 || weights->ne[0] != 1 || weights->ne[1] != 6 ||
+                weights->ne[2] != input->ne[2]) { continue; }
+        bool match = true;
+        for (int slot = 0; slot < 6; ++slot) {
+            ggml_tensor * view = graph->nodes[i + 2 + slot];
+            match &= view->op == GGML_OP_VIEW && view->src[0] == weighted;
+        }
+        ggml_tensor * sum = graph->nodes[i + 2];
+        for (int slot = 1; slot < 6; ++slot) {
+            ggml_tensor * add = graph->nodes[i + 7 + slot];
+            match &= add->op == GGML_OP_ADD && add->src[0] == sum && add->src[1] == graph->nodes[i + 2 + slot];
+            sum = add;
+        }
+        if (!match) { continue; }
+        params->add_alloc_dep(params->user_data, input, sum);
+        params->add_alloc_dep(params->user_data, ids, sum);
+        params->add_alloc_dep(params->user_data, weights, sum);
+        if (getenv("DSV41_MOE_TRACE")) {
+            GGML_LOG_INFO("dsv41_moe_meta_deps: nt=%lld node=%s\n", (long long) input->ne[2], mm->name);
+        }
+        i += 12;
+    }
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -2531,7 +2578,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
-    /* .graph_optimize          = */ nullptr,
+    /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
