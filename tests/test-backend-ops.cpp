@@ -5865,12 +5865,14 @@ struct test_mul_mat_id_fusion : public test_case {
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
+    const int n_mats;
+    const int n_used;
     ggml_tensor * routed = nullptr;
     ggml_tensor * shared = nullptr;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    test_mul_mat_id_shared(ggml_type type, int64_t n, int n_mats = 8, int n_used = 3) : type(type), n(n), n_mats(n_mats), n_used(n_used) {}
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string vars() override { return VARS_TO_STR4(type, n, n_mats, n_used); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -5879,10 +5881,10 @@ struct test_mul_mat_id_shared : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n);
         ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, 512, 1, n);
-        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
         ggml_set_name(ids, "ids");
-        ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, n_mats);
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, n_mats);
         ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
         ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
         routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
@@ -5891,7 +5893,7 @@ struct test_mul_mat_id_shared : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, 8);
+        init_mul_mat_id_tensors(ctx, n_mats);
     }
 };
 
@@ -11501,6 +11503,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
+        // many experts: MMVQ beyond its batch table
+        for (int64_t n : { 12, 16 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n, 384, 6));
+        }
     }
 
     // gpt-oss issue with Vulkan mmq_id
@@ -11598,6 +11604,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 // test with mul after (ffn_moe_weighted)
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
             }
+        }
+    }
+
+    // many experts, few tokens per expert: MMVQ beyond its batch table (token chunks), MMQ tile width from the average
+    for (ggml_type type_a : {GGML_TYPE_MXFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int bs : {9, 16, 17, 64, 300}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 384, 6, false, 256, bs, 512));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 384, 6, false, 256, bs, 512, 1, true));
         }
     }
 
@@ -12850,6 +12864,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // deepseek-v4.1-flash: MXFP4 experts (384, top-6) and Q8_0 dense projections at draft-verification batch sizes
+    for (int bs : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 2304, bs, 5120));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 5120, bs, 2304));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 2304, bs, 5120, 1));
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{32768, 1280}, {5120, 8192}, {1280, 5120}, {2304, 5120}, {5120, 2304}, {512, 5120}, {4096, 1280}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+        }
+    }
+    // deepseek-v4.1-flash with the experts requantized to Q8_0
+    for (int bs : {8, 16, 64, 128, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 384, 6, false, 2304, bs, 5120));
+    }
+
+    // deepseek-v4.1-flash expert shapes with 256 experts: MMVQ vs MMQ around 4*n_tokens*n_used == n_experts
+    for (int bs : {8, 10, 11, 12, 16}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2304, bs, 5120));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 5120, bs, 2304));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2304, bs, 5120, 1));
+    }
+
+    // MUL_MAT_ID kernel choice around n_tokens*n_used == n_experts: qwen3-30b-a3b and deepseek-v3 experts
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_MXFP4}) {
+        for (int bs : {12, 16, 24}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 768, bs, 2048));
+        }
+        for (int bs : {16, 24, 32, 48}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs, 7168));
+        }
+    }
+    for (int bs : {24, 32, 48, 64, 128, 256, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 2304, bs, 5120));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 5120, bs, 2304));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 2304, bs, 5120, 1));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

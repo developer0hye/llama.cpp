@@ -131,6 +131,23 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+// Number of columns to pick the MUL_MAT_ID tile width against: each expert only sees ne12*n_expert_used/n_experts tokens on average.
+static int64_t ggml_cuda_mmq_moe_ncols_opt(
+        const ggml_type type, const int cc, const int64_t ne12, const int64_t n_expert_used, const int64_t n_experts) {
+    // On RDNA3 and RDNA4 it is faster to pick the tile size against the average instead of ne12.
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return (ne12*n_expert_used + n_experts - 1) / n_experts;
+    }
+    // On Ampere a tile sized for 1.5x the average fits most experts and wastes far fewer columns than one sized for ne12,
+    // but MXFP4 and Q8_0 tiles get less efficient below a minimum width.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+        const int64_t ncols_min = type == GGML_TYPE_Q8_0 ? 32 : type == GGML_TYPE_MXFP4 ? 16 : 8;
+        const int64_t ncols_avg = (3*ne12*n_expert_used + 2*n_experts - 1) / (2*n_experts);
+        return std::min(ne12, std::max(ncols_avg, ncols_min));
+    }
+    return ne12;
+}
+
 // Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
 static int ggml_cuda_mmq_get_J_best(
         const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
@@ -235,17 +252,7 @@ void ggml_cuda_mul_mat_q(
     int J_best        = 0;
     int nthreads_best = 0;
     {
-        int64_t ncols_opt = ne11;
-        if (ids) {
-            const int64_t n_expert_used = ids->ne[0];
-            ncols_opt = ne12;
-
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-            }
-        }
+        const int64_t ncols_opt = ids ? ggml_cuda_mmq_moe_ncols_opt(src0->type, cc, ne12, ids->ne[0], ne02) : ne11;
 
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
     }
@@ -513,14 +520,16 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {
+bool ggml_cuda_mmq_fusion_is_efficient(
+        const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int64_t n_expert_used, const int device) {
     const int    cc    = ggml_cuda_info().devices[device].cc;
     const int    nsm   = ggml_cuda_info().devices[device].nsm;
     const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
 
     // Same tile width as ggml_cuda_mul_mat_q; the fused kernel has no fallback, quantizes src1 to Q8_1 and writes I/2 output rows per tile.
-    const bool fallback = false;
-    const int  J_best   = ggml_cuda_mmq_get_J_best(type, ncols, fallback, cc, smpbo, GGML_PREC_Q8);
+    const bool    fallback  = false;
+    const int64_t ncols_opt = n_expert_used > 0 ? ggml_cuda_mmq_moe_ncols_opt(type, cc, ncols, n_expert_used, nchannels) : ncols;
+    const int     J_best    = ggml_cuda_mmq_get_J_best(type, ncols_opt, fallback, cc, smpbo, GGML_PREC_Q8);
     if (J_best == 0) {
         return false;
     }
