@@ -8,6 +8,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
+#define MMVQ_MMID_MAX_TOKENS 64 // Max. number of tokens for the MMVQ MUL_MAT_ID kernel, which splits the tokens over the grid.
+
+// Whether MUL_MAT_ID with n_tokens tokens should use MMVQ. Above get_mmvq_mmid_max_batch this is only the case
+// when n_tokens*n_used is small relative to n_experts, i.e. the tokens rarely share an expert and MMQ has no reuse.
+bool ggml_cuda_should_use_mmvq_mmid(ggml_type type, int cc, int64_t n_tokens, int64_t n_experts, int64_t n_used);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 

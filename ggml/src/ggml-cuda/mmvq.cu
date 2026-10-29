@@ -315,6 +315,16 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+bool ggml_cuda_should_use_mmvq_mmid(ggml_type type, int cc, int64_t n_tokens, int64_t n_experts, int64_t n_used) {
+    if (n_tokens <= get_mmvq_mmid_max_batch(type, cc)) {
+        return true;
+    }
+    // MMVQ reads the experts of each token separately, on Ampere this is cheaper than MMQ while the tokens rarely share
+    // an expert: at most a quarter of a token per expert on average (DeepSeek-V4.1: 384 experts, 6 used, 16 tokens).
+    const bool ampere = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE;
+    return ampere && n_tokens <= MMVQ_MMID_MAX_TOKENS && 4*n_tokens*n_used <= n_experts;
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -874,8 +884,8 @@ static __global__ void mul_mat_vec_q(
 }
 
 // Dedicated MoE multi-token kernel.
-// Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
-// Block: (warp_size, ncols_dst) - each warp handles one token independently.
+// Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst, token chunks)
+// Block: (warp_size, tokens per chunk) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
@@ -928,7 +938,7 @@ static __global__ void mul_mat_vec_q_moe(
         }
     }
 
-    const uint32_t token_idx   = threadIdx.y;
+    const uint32_t token_idx   = threadIdx.y + blockIdx.z*blockDim.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
@@ -1086,8 +1096,12 @@ static void mul_mat_vec_q_moe_launch(
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
-    const dim3 block_dims(warp_size, ncols_dst);
+    // at most get_mmvq_mmid_max_batch warps per block (the kernel's launch bounds), the remaining tokens go to grid z
+    const int max_tokens_block = get_mmvq_mmid_max_batch(type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    const int nchunks          = (ncols_dst + max_tokens_block - 1) / max_tokens_block;
+    const int tokens_block     = (ncols_dst + nchunks - 1) / nchunks;
+    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr), nchunks);
+    const dim3 block_dims(warp_size, tokens_block);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
@@ -1119,7 +1133,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(ncols_dst <= (ids ? MMVQ_MMID_MAX_TOKENS : MMVQ_MAX_BATCH_SIZE));
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -1472,7 +1486,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MMID_MAX_TOKENS);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -1482,7 +1496,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+        GGML_ASSERT( !ids || ggml_cuda_should_use_mmvq_mmid(src0->type, cc, dst->ne[2], src0->ne[2], ids->ne[0]));
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
