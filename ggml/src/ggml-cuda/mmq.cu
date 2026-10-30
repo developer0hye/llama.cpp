@@ -132,6 +132,22 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 }
 
 // Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
+// Tile width target for MUL_MAT_ID: each expert only sees ne12*n_expert_used/n_experts tokens on average.
+static int64_t ggml_cuda_mmq_moe_ncols_opt(
+        const ggml_type type, const int cc, const int64_t ne12, const int64_t n_expert_used, const int64_t n_experts) {
+    // On RDNA3 and RDNA4 it is faster to pick the tile size against the average instead of ne12.
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return (ne12*n_expert_used + n_experts - 1) / n_experts;
+    }
+    // With the tile list of launch_mul_mat_q narrow tiles add no empty blocks: 1.5x the average.
+    // Q8_0 tiles narrower than 32 and other tiles narrower than 16 lose more efficiency than they save.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        const int64_t ncols_min = type == GGML_TYPE_Q8_0 ? 32 : 16;
+        return std::min(ne12, std::max(ncols_min, (3*ne12*n_expert_used + 2*n_experts - 1) / (2*n_experts)));
+    }
+    return ne12;
+}
+
 static int ggml_cuda_mmq_get_J_best(
         const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
         int * nthreads_best = nullptr) {
@@ -235,17 +251,7 @@ void ggml_cuda_mul_mat_q(
     int J_best        = 0;
     int nthreads_best = 0;
     {
-        int64_t ncols_opt = ne11;
-        if (ids) {
-            const int64_t n_expert_used = ids->ne[0];
-            ncols_opt = ne12;
-
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-            }
-        }
+        const int64_t ncols_opt = ids ? ggml_cuda_mmq_moe_ncols_opt(src0->type, cc, ne12, ids->ne[0], ne02) : ne11;
 
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
     }
@@ -513,19 +519,24 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {
+bool ggml_cuda_mmq_fusion_is_efficient(
+        const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int64_t n_expert_used, const int device) {
     const int    cc    = ggml_cuda_info().devices[device].cc;
     const int    nsm   = ggml_cuda_info().devices[device].nsm;
     const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
 
     // Same tile width as ggml_cuda_mul_mat_q; the fused kernel has no fallback, quantizes src1 to Q8_1 and writes I/2 output rows per tile.
     const bool fallback = false;
-    const int  J_best   = ggml_cuda_mmq_get_J_best(type, ncols, fallback, cc, smpbo, GGML_PREC_Q8);
+    const int64_t ncols_opt = n_expert_used > 0 ? ggml_cuda_mmq_moe_ncols_opt(type, cc, ncols, n_expert_used, nchannels) : ncols;
+    const int  J_best   = ggml_cuda_mmq_get_J_best(type, ncols_opt, fallback, cc, smpbo, GGML_PREC_Q8);
     if (J_best == 0) {
         return false;
     }
     const int64_t nrows_tile = ggml_cuda_mmq_get_config(type, J_best, fallback, cc, GGML_PREC_Q8).I / 2;
-    const int64_t ntiles     = (ncols + J_best - 1)/J_best * ((nrows_x + nrows_tile - 1)/nrows_tile) * nchannels;
+    // MUL_MAT_ID with the tile list: at most ncols*n_expert_used/J + n_experts column tiles over all experts.
+    const int64_t ntiles_col = n_expert_used > 0 && ncols > J_best ?
+        (ncols*n_expert_used + J_best - 1)/J_best + nchannels : (ncols + J_best - 1)/J_best * nchannels;
+    const int64_t ntiles     = ntiles_col * ((nrows_x + nrows_tile - 1)/nrows_tile);
     // Same condition as launch_mul_mat_q uses to run the stream-k kernel with one block per tile.
     const int64_t tiles_nwaves             = (ntiles + nsm - 1) / nsm;
     const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);

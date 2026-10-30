@@ -1000,7 +1000,7 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fu
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int32_t * __restrict__ expert_bounds, const int2 * __restrict__ moe_tiles, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale, const ggml_glu_op glu_op, const float glu_limit,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -1049,9 +1049,18 @@ static __global__ void mul_mat_q(
 
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.x;
+        int zt = tmp2.y;
+        int jt = blockIdx.x;
         const int it = blockIdx.y;
+
+        if (moe_tiles) {
+            const int2 tile = moe_tiles[blockIdx.x];
+            if (tile.x < 0) {
+                return;
+            }
+            zt = tile.x;
+            jt = tile.y;
+        }
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1132,14 +1141,29 @@ static __global__ void mul_mat_q(
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
         int tmp = fastdiv(kbc, blocks_per_ne00);
         uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
+        int jt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nchannels_y);
-        const int zt = tmp2.y;
+        int zt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nsamples_y);
         const int wt = tmp2.y;
         const int it = tmp2.x;
+
+        if (moe_tiles) {
+            const int2 tile = moe_tiles[zt];
+            if (tile.x < 0) {
+                kbc += blocks_per_ne00.z;
+                kbc -= fastmodulo(kbc, blocks_per_ne00);
+
+                kb0_start = 0;
+                kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
+
+                continue;
+            }
+            zt = tile.x;
+            jt = tile.y;
+        }
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1221,14 +1245,23 @@ static __global__ void mul_mat_q(
 
     int tmp = fastdiv(kbc, blocks_per_ne00);
     uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
+    int jt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nchannels_y);
-    const int zt = tmp2.y;
+    int zt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
     const int it = tmp2.x;
+
+    if (moe_tiles) {
+        const int2 tile = moe_tiles[zt];
+        if (tile.x < 0) {
+            return;
+        }
+        zt = tile.x;
+        jt = tile.y;
+    }
 
     // Defaults for regular matrix multiplication:
     int col_low    = 0;
@@ -1449,6 +1482,36 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// MUL_MAT_ID: list the (expert, column tile) pairs that hold tokens, the tiles of an expert next to each other, -1 for unused entries.
+// The sum over experts of ceil(n_tokens/J) is at most ncols_dst/J + n_experts.
+static __global__ void mmq_moe_build_tiles(
+        const int32_t * __restrict__ expert_bounds, const int n_experts, const int J, int2 * __restrict__ tiles, const int max_tiles) {
+    constexpr int nthreads = 512;
+    __shared__ int scan[nthreads];
+    int n_before = 0;
+    for (int e0 = 0; e0 < n_experts; e0 += nthreads) {
+        const int e = e0 + threadIdx.x;
+        const int n = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
+        scan[threadIdx.x] = n;
+        __syncthreads();
+        for (int offset = 1; offset < nthreads; offset *= 2) {
+            const int v = threadIdx.x >= offset ? scan[threadIdx.x - offset] : 0;
+            __syncthreads();
+            scan[threadIdx.x] += v;
+            __syncthreads();
+        }
+        const int start = n_before + scan[threadIdx.x] - n;
+        for (int j = 0; j < n; ++j) {
+            tiles[start + j] = make_int2(e, j);
+        }
+        n_before += scan[nthreads - 1];
+        __syncthreads();
+    }
+    for (int t = n_before + threadIdx.x; t < max_tiles; t += nthreads) {
+        tiles[t] = make_int2(-1, 0);
+    }
+}
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1487,10 +1550,41 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    // MUL_MAT_ID: one CUDA block per row tile and listed column tile.
+    // With many experts most blocks of a grid over all experts x ncols_max/J column tiles would find no tokens.
+    if (args.expert_bounds && ntx > 1 && args.nsamples_y == 1 && args.nchannels_x == args.nchannels_y) {
+        const int max_tiles = (args.ncols_dst + config.J - 1)/config.J + args.nchannels_y;
+        ggml_cuda_pool_alloc<int2> moe_tiles(ctx.pool(id), max_tiles);
+        mmq_moe_build_tiles<<<1, 512, 0, stream>>>(args.expert_bounds, args.nchannels_y, config.J, moe_tiles.get(), max_tiles);
+        CUDA_CHECK(cudaGetLastError());
+
+        const uint3 one_fd       = init_fastdiv_values(1);
+        const uint3 max_tiles_fd = init_fastdiv_values(max_tiles);
+        if (has_fusion || !config.stream_k) {
+            GGML_ASSERT(nty <= 65535); // gridDim.y limit
+            mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<dim3(max_tiles, nty, 1), block_dims, nbytes_shared, stream>>>
+                (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, moe_tiles.get(), args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd);
+        } else {
+            // Stream-k kernel with one block per tile, no fixup: the channel index runs over the list.
+            GGML_ASSERT(int64_t(nty) * max_tiles * blocks_per_ne00_fd.z < (1 << 30));
+            mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<nty * max_tiles, block_dims, nbytes_shared, stream>>>
+                (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, moe_tiles.get(), args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 one_fd, max_tiles_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 one_fd);
+        }
+        return;
+    }
+
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nty <= 65535); // gridDim.y limit
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+            (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, nullptr, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1521,7 +1615,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
     mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+        (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, nullptr, args.dst, tmp_fixup.ptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1661,4 +1755,5 @@ void ggml_cuda_mul_mat_q(
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
-bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
+// n_expert_used > 0 for MUL_MAT_ID, nchannels is then the number of experts.
+bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, int64_t nrows_x, int64_t ncols, int64_t nchannels, int64_t n_expert_used, int device);
