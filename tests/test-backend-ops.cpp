@@ -11628,6 +11628,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // many experts with few tokens each: MMQ only launches the tiles that hold tokens
+    for (ggml_type type_a : {GGML_TYPE_MXFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int bs : {9, 16, 17, 64, 300}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 384, 6, false, 256, bs, 512));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 384, 6, false, 256, bs, 512, 1, true));
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             for (int n : {1, 16}) {
@@ -12877,6 +12885,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // deepseek-v4.1-flash MXFP4 experts (384, top-6)
+    for (int bs : {16, 32, 64, 128, 256, 512, 1024}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 2304, bs, 5120));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 5120, bs, 2304));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_MXFP4, GGML_TYPE_F32, 384, 6, false, 2304, bs, 5120, 1));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
