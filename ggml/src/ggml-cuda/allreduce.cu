@@ -237,6 +237,170 @@ static __global__ void ggml_cuda_ar_kernel(
     }
 }
 
+// Chunked kernel AllReduce with the arrival token carried in the data (as in
+// NCCL's LL protocol): each 16-byte word in host memory holds 12 bytes of
+// values and the token of this AR call, written with one 16-byte store.  A
+// peer spins on each word until it carries the expected token, so the data is
+// complete without the system-scope fences and the arrival-int round trip of
+// ggml_cuda_ar_kernel.  The sums are the same: rank order, the local sendbuf
+// value also rounded through T_wire.
+template <typename T>
+static __device__ __forceinline__ int4 ggml_cuda_ar_ll_pack(const T (&v)[12 / sizeof(T)], int token) {
+    int4 w;
+    memcpy(&w, v, 12);
+    w.w = token;
+    return w;
+}
+
+static __device__ __forceinline__ int4 ggml_cuda_ar_ll_wait(const int4 * src, int token) {
+    int4 w = __ldcv(src);
+    while (w.w != token) {
+#ifdef GGML_USE_HIP
+        __builtin_amdgcn_s_sleep(1);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        __nanosleep(64);
+#endif // GGML_USE_HIP
+        w = __ldcv(src);
+    }
+    return w;
+}
+
+template <typename T_dst, typename T_wire>
+static __device__ __forceinline__ void ggml_cuda_ar_ll_load_local(
+        const T_dst * sendbuf, int i0, int count, T_wire (&wire)[12 / sizeof(T_wire)]) {
+    #pragma unroll
+    for (int k = 0; k < 12 / (int) sizeof(T_wire); ++k) {
+        wire[k] = ggml_cuda_cast<T_wire>(i0 + k < count ? sendbuf[i0 + k] : T_dst(0.0f));
+    }
+}
+
+// One round: every rank stages all its words and reads all words of every peer.
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_ll_kernel(
+        const T_dst  *              sendbuf,
+        T_dst        *              recvbuf,
+        const ggml_cuda_ar_ranks    ranks,
+        int                         n_ranks,
+        int                         rank,
+        int                         count,
+        int                         token) {
+
+    constexpr int E = 12 / sizeof(T_wire);
+
+    const int gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gnt    = gridDim.x * blockDim.x;
+    const int nwords = (count + E - 1) / E;
+
+    int4 * host_mine = static_cast<int4 *>(ranks.host[rank]);
+
+    for (int w = gtid; w < nwords; w += gnt) {
+        T_wire wire[E];
+        ggml_cuda_ar_ll_load_local(sendbuf, w*E, count, wire);
+        host_mine[w] = ggml_cuda_ar_ll_pack(wire, token);
+    }
+
+    for (int w = gtid; w < nwords; w += gnt) {
+        float sum[E];
+        #pragma unroll
+        for (int r = 0; r < GGML_CUDA_MAX_DEVICES; ++r) {
+            if (r >= n_ranks) {
+                break;
+            }
+            T_wire wire[E];
+            if (r == rank) {
+                ggml_cuda_ar_ll_load_local(sendbuf, w*E, count, wire);
+            } else {
+                const int4 v = ggml_cuda_ar_ll_wait(static_cast<const int4 *>(ranks.host[r]) + w, token);
+                memcpy(wire, &v, 12);
+            }
+            #pragma unroll
+            for (int k = 0; k < E; ++k) {
+                sum[k] = r == 0 ? ggml_cuda_cast<float>(wire[k]) : sum[k] + ggml_cuda_cast<float>(wire[k]);
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < E; ++k) {
+            if (w*E + k < count) {
+                recvbuf[w*E + k] = ggml_cuda_cast<T_dst>(sum[k]);
+            }
+        }
+    }
+}
+
+// Reduce-scatter and all-gather for more than 2 ranks, T_wire == T_dst: every
+// rank stages all its words (region A), sums one slice of the words over all
+// ranks and stages the sums (region B), then reads the slices of the others
+// from region B.  Each rank reads 2 (n-1)/n of the data instead of (n-1) times
+// the data.  recvbuf is only written from region B, after the owner of the
+// slice has read every sendbuf value of it, so recvbuf may alias sendbuf.
+template <typename T>
+static __global__ void ggml_cuda_ar_rsag_kernel(
+        const T  *                  sendbuf,
+        T        *                  recvbuf,
+        const ggml_cuda_ar_ranks    ranks,
+        int                         n_ranks,
+        int                         rank,
+        int                         count,
+        int                         token) {
+
+    constexpr int E = 12 / sizeof(T);
+
+    const int gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gnt    = gridDim.x * blockDim.x;
+    const int nwords = (count + E - 1) / E;
+    const int per    = (nwords + n_ranks - 1) / n_ranks;
+
+    int4 * a_mine = static_cast<int4 *>(ranks.host[rank]);
+    int4 * b_mine = a_mine + nwords;
+
+    for (int w = gtid; w < nwords; w += gnt) {
+        T wire[E];
+        ggml_cuda_ar_ll_load_local(sendbuf, w*E, count, wire);
+        a_mine[w] = ggml_cuda_ar_ll_pack(wire, token);
+    }
+
+    const int w_end = min(nwords, (rank + 1)*per);
+    for (int w = rank*per + gtid; w < w_end; w += gnt) {
+        float sum[E];
+        #pragma unroll
+        for (int r = 0; r < GGML_CUDA_MAX_DEVICES; ++r) {
+            if (r >= n_ranks) {
+                break;
+            }
+            T wire[E];
+            if (r == rank) {
+                ggml_cuda_ar_ll_load_local(sendbuf, w*E, count, wire);
+            } else {
+                const int4 v = ggml_cuda_ar_ll_wait(static_cast<const int4 *>(ranks.host[r]) + w, token);
+                memcpy(wire, &v, 12);
+            }
+            #pragma unroll
+            for (int k = 0; k < E; ++k) {
+                sum[k] = r == 0 ? ggml_cuda_cast<float>(wire[k]) : sum[k] + ggml_cuda_cast<float>(wire[k]);
+            }
+        }
+        T res[E];
+        #pragma unroll
+        for (int k = 0; k < E; ++k) {
+            res[k] = ggml_cuda_cast<T>(sum[k]);
+        }
+        b_mine[w] = ggml_cuda_ar_ll_pack(res, token);
+    }
+
+    for (int w = gtid; w < nwords; w += gnt) {
+        const int4 * b_owner = static_cast<const int4 *>(ranks.host[w / per]) + nwords;
+        const int4 v = ggml_cuda_ar_ll_wait(b_owner + w, token);
+        T res[E];
+        memcpy(res, &v, 12);
+        #pragma unroll
+        for (int k = 0; k < E; ++k) {
+            if (w*E + k < count) {
+                recvbuf[w*E + k] = res[k];
+            }
+        }
+    }
+}
+
 // Combined load-convert-add kernel.  The peer's contribution arrives as T_src
 // (which may be a lower-precision type than T_dst when the BF16 round-trip is
 // active).  For bit-equivalence between the two GPUs, dst is first rounded
@@ -938,9 +1102,18 @@ bool ggml_cuda_ar_allreduce(
             }
         }
     } else {
-        // host_buf carries T_wire-typed data; max_chunk_elems is the count that
-        // fits in one host_buf at the wire size.
-        const size_t max_chunk_elems = p->buf_bytes / type_size;
+        // Up to 40 KB per rank one round of ggml_cuda_ar_ll_kernel. Above that, with more than 2 ranks, the
+        // reduce-scatter and all-gather of ggml_cuda_ar_rsag_kernel: its second host round trip costs less than reading
+        // n-1 copies of the data (8x A6000: 20 KB 15 vs 24 us, 80 KB 43 vs 29 us). Other large tensors keep the fenced
+        // ggml_cuda_ar_kernel, which moves no token bytes (512 KB: 172 vs 226 us for one LL round).
+        const bool   small_tensor    = (size_t) ne * type_size <= 40*1024;
+        const bool   use_rsag        = !small_tensor && n > 2 && !use_bf16;
+        const bool   use_ll          = small_tensor;
+        // host_buf carries T_wire-typed data; max_chunk_elems is the count that fits in one host_buf: the LL kernels
+        // store 12 bytes of data per 16-byte word, the reduce-scatter one in two regions.
+        const size_t elems_per_word  = 12 / type_size;
+        const size_t max_chunk_elems = !use_ll && !use_rsag ? p->buf_bytes / type_size :
+            (p->buf_bytes / (use_rsag ? 32 : 16)) * elems_per_word;
         const size_t input_type_size = ggml_type_size(input_type);
 
         // Chunked kernel path runs entirely on the caller's compute stream:
@@ -979,12 +1152,28 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
-                    reinterpret_cast<const T_dst *>(data), \
-                    reinterpret_cast<T_dst *>(data), \
-                    ranks, n, i, \
-                    static_cast<int>(chunk_elems), \
-                    token)
+                if (use_rsag) { \
+                    ggml_cuda_ar_rsag_kernel<T_dst><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                        reinterpret_cast<const T_dst *>(data), \
+                        reinterpret_cast<T_dst *>(data), \
+                        ranks, n, i, \
+                        static_cast<int>(chunk_elems), \
+                        token); \
+                } else if (use_ll) { \
+                    ggml_cuda_ar_ll_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                        reinterpret_cast<const T_dst *>(data), \
+                        reinterpret_cast<T_dst *>(data), \
+                        ranks, n, i, \
+                        static_cast<int>(chunk_elems), \
+                        token); \
+                } else { \
+                    ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                        reinterpret_cast<const T_dst *>(data), \
+                        reinterpret_cast<T_dst *>(data), \
+                        ranks, n, i, \
+                        static_cast<int>(chunk_elems), \
+                        token); \
+                }
 
                 if (use_bf16) {
                     GGML_ASSERT(input_type == GGML_TYPE_F32);
