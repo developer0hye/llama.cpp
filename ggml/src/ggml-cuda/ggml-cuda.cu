@@ -5029,17 +5029,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
+                if (properties_changed && graph->changed_last_call) {
+                    // Properties changed on consecutive calls - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     if (ggml_cuda_graph_debug_enabled()) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     }
                 } else {
+                    // A stable graph that changed once (e.g. the KV cache got longer) is captured again right away,
+                    // the executable is updated in place. Executing it directly first would launch every kernel
+                    // from the host, for every device with -sm tensor.
                     use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instances.empty();
+                    cuda_graph_update_required = properties_changed || graph->instances.empty();
                 }
             }
+            graph->changed_last_call = properties_changed;
         }
     }
 #endif // USE_CUDA_GRAPH
