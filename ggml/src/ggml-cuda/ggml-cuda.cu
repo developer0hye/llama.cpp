@@ -3282,6 +3282,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
+    args.norm_bias       = false;
     args.n_groups        = 0;
     args.n_group_used    = 0;
 
@@ -3402,8 +3403,8 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     }
 
     if (nodes[node_idx]->op == GGML_OP_RESHAPE) {
-        //check RESHAPE->SUM_ROWS->CLAMP->DIV->RESHAPE
-        static const std::vector<ggml_op> norm_ops = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP };
+        //check RESHAPE->SUM_ROWS->CLAMP->DIV->RESHAPE, or SCALE with scale 1 (a bias for the sum) instead of CLAMP
+        static const std::vector<ggml_op> norm_ops = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS };
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
@@ -3413,6 +3414,16 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
                 args.norm = false;
                 return true;
             }
+        }
+        if (node_idx < n_nodes && nodes[node_idx]->src[0] == nodes[node_idx - 1] && nodes[node_idx]->op == GGML_OP_SCALE &&
+                ggml_get_op_params_f32(nodes[node_idx], 0) == 1.0f) {
+            args.norm_bias = true;
+            node_idx++;
+        } else if (node_idx < n_nodes && nodes[node_idx]->src[0] == nodes[node_idx - 1] && nodes[node_idx]->op == GGML_OP_CLAMP) {
+            node_idx++;
+        } else {
+            args.norm = false;
+            return true;
         }
 
         // DIV <- CLAMP, RESHAPE
@@ -4049,8 +4060,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ids = cgraph->nodes[out_nodes[0]];
 
                 if (args.norm) {
-                    ops.insert(ops.end(),
-                               { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                    ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_bias ? GGML_OP_SCALE : GGML_OP_CLAMP,
+                                            GGML_OP_DIV, GGML_OP_RESHAPE });
                     clamp = cgraph->nodes[i + ops.size() - 3];
                 }
                 if (args.scale) {
