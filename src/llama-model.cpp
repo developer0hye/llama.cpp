@@ -455,6 +455,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
+    static const std::regex pattern_engram_kv_weight("blk\\.\\d*\\.engram_kv\\.weight");
+
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
 
@@ -534,6 +536,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_engram_kv_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
         }
 
@@ -625,7 +630,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
             if (is_dsv4) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                // split along n_embd instead of the vocab so that the logits are replicated after the AllReduce:
+                // a DSpark draft shares this head and runs row ops (top-k, softmax) on its logits
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
@@ -866,6 +873,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
                 return {hparams.n_head(il) / hparams.n_head_kv(il)};
             }
+        }
+
+        if (is_dsv4 && (std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_engram_kv_weight))) {
+            GGML_ASSERT(segments.size() == 1);
+            return {std::lcm(blck_size, 128)};
         }
 
         // everything else

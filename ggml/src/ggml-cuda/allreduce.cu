@@ -765,11 +765,13 @@ bool ggml_cuda_ar_allreduce(
     // BF16 round-trip: F32 inputs >= bf16_threshold are converted to BF16 for
     // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
     // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
-    // inner paths see them as already-prepared compute tensors.
+    // inner paths see them as already-prepared compute tensors.  Outputs
+    // such as partial logits stay F32, also as on the NCCL path.
     const bool use_bf16 =
         input_type == GGML_TYPE_F32 &&
         p->bf16_threshold > 0 &&
-        input_nbytes >= p->bf16_threshold;
+        input_nbytes >= p->bf16_threshold &&
+        (tensors[0]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
 
     const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
     const size_t    type_size   = ggml_type_size(kernel_type);

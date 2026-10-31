@@ -1153,7 +1153,9 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    // Outputs such as partial logits are always reduced as FP32 to keep their precision.
+    const bool is_output = tensors[0]->flags & GGML_TENSOR_FLAG_OUTPUT;
+    if (is_output || (n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
