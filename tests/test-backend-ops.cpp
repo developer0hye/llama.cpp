@@ -4082,6 +4082,48 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM without weight + GGML_OP_MUL_MAT (hyper-connection mixes)
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t k;
+    const int64_t n;
+    const int64_t nc; // channels
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m, k, n, nc, eps);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_mul_mat(ggml_type type = GGML_TYPE_F32, int64_t m = 24, int64_t k = 20480, int64_t n = 1,
+            int64_t nc = 1, float eps = 1e-6f)
+        : type(type), m(m), k(k), n(n), nc(nc), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type, k, m, nc);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, nc);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, ggml_rms_norm(ctx, b, eps));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -11001,6 +11043,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+    }
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (int64_t n : { 1, 3 }) {
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type, 24, 20480, n));
+        }
+        for (float eps : { 1e-6f, 1e-1f }) {
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type, 16, 64, 1, 1, eps));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type, 24, 1000, 1, 3, eps));
+        }
     }
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));

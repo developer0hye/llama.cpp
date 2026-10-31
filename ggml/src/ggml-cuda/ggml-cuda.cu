@@ -3757,6 +3757,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    // rms_norm without weight as the vector of a mul_mat: mmvf normalizes the vector while it reads it
+    std::initializer_list<enum ggml_op> rms_norm_mul_mat_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT };
+
+    if (is_equal(rms_norm_mul_mat_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 })) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * mul_mat  = cgraph->nodes[node_idx + 1];
+
+        if (ggml_check_edges(cgraph, node_idx, {{1, 1, 0}}) &&
+            rms_norm->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(rms_norm->src[0]) &&
+            ggml_cuda_should_fuse_mul_mat_vec_f(mul_mat)) {
+            int out_nodes[] = { node_idx + 1 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+        return false;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4688,6 +4704,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT }, {})) {
+        ggml_tensor * mul_mat = cgraph->nodes[i + 1];
+        ggml_cuda_mm_fusion_args_host fusion_data{};
+        fusion_data.rms_norm = node;
+        ggml_cuda_mul_mat_vec_f(*cuda_ctx, mul_mat->src[0], node->src[0], nullptr, mul_mat, &fusion_data);
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
