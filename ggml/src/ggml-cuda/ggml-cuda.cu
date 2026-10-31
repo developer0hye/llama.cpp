@@ -3282,6 +3282,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
+    args.norm_bias       = false;
     args.n_groups        = 0;
     args.n_group_used    = 0;
 
@@ -3402,8 +3403,8 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     }
 
     if (nodes[node_idx]->op == GGML_OP_RESHAPE) {
-        //check RESHAPE->SUM_ROWS->CLAMP->DIV->RESHAPE
-        static const std::vector<ggml_op> norm_ops = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP };
+        //check RESHAPE->SUM_ROWS->CLAMP->DIV->RESHAPE, or SCALE with scale 1 (a bias for the sum) instead of CLAMP
+        static const std::vector<ggml_op> norm_ops = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS };
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
@@ -3413,6 +3414,16 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
                 args.norm = false;
                 return true;
             }
+        }
+        if (node_idx < n_nodes && nodes[node_idx]->src[0] == nodes[node_idx - 1] && nodes[node_idx]->op == GGML_OP_SCALE &&
+                ggml_get_op_params_f32(nodes[node_idx], 0) == 1.0f) {
+            args.norm_bias = true;
+            node_idx++;
+        } else if (node_idx < n_nodes && nodes[node_idx]->src[0] == nodes[node_idx - 1] && nodes[node_idx]->op == GGML_OP_CLAMP) {
+            node_idx++;
+        } else {
+            args.norm = false;
+            return true;
         }
 
         // DIV <- CLAMP, RESHAPE
@@ -4055,8 +4066,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const size_t n_ops_get_rows = ops.size();
 
                 if (args.norm) {
-                    ops.insert(ops.end(),
-                               { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                    ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_bias ? GGML_OP_SCALE : GGML_OP_CLAMP,
+                                            GGML_OP_DIV, GGML_OP_RESHAPE });
                     clamp = cgraph->nodes[i + ops.size() - 3];
                 }
                 if (args.scale) {
@@ -4073,12 +4084,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (!fuse && ops.size() > n_ops_get_rows) {
                     // the weights after the norm or scale can alias a tensor that is still read, fuse up to GET_ROWS only
                     ops.resize(n_ops_get_rows);
-                    args.norm    = false;
-                    args.scale   = false;
-                    clamp        = nullptr;
-                    scale        = nullptr;
-                    weights      = cgraph->nodes[i + ops.size() - 1];
-                    out_nodes[1] = i + ops.size() - 1;
+                    args.norm      = false;
+                    args.norm_bias = false;
+                    args.scale     = false;
+                    clamp          = nullptr;
+                    scale          = nullptr;
+                    weights        = cgraph->nodes[i + ops.size() - 1];
+                    out_nodes[1]   = i + ops.size() - 1;
 
                     fuse = ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
@@ -5209,8 +5221,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         ids = cgraph->nodes[out_nodes[0]];
 
                         if (args.norm) {
-                            ops.insert(ops.end(),
-                                       { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS,
+                                                    args.norm_bias ? GGML_OP_SCALE : GGML_OP_CLAMP, GGML_OP_DIV,
+                                                    GGML_OP_RESHAPE });
                         }
                         if (args.scale) {
                             ops.insert(ops.end(), { GGML_OP_SCALE });
