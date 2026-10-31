@@ -1108,9 +1108,9 @@ struct ggml_backend_cuda_comm_context {
     std::vector<ggml_backend_t> backends;
     std::vector<int>            dev_ids;
 
-    // Set by the init chain (comm_init_{nccl, internal, none}) to one of
-    // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
+    // Set by the init chain (comm_init_{nccl, internal, hybrid, none}) to one of
+    // try_allreduce_{nccl, internal, hybrid, butterfly}.  nccl needs `comms`,
+    // internal needs `ar_pipeline`, hybrid needs both, butterfly needs nothing.  Per-call
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
@@ -1268,6 +1268,18 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
 }
+
+// Largest tensor (bytes per GPU) that the hybrid mode reduces with the internal AllReduce: the activations of a few
+// tokens, where its latency is lower than NCCL's; larger tensors (prompt processing) go through NCCL.
+static constexpr size_t GGML_CUDA_COMM_HYBRID_MAX_BYTES = 1024 * 1024;
+
+static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (ggml_nbytes(tensors[0]) <= GGML_CUDA_COMM_HYBRID_MAX_BYTES && ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
+        return true;
+    }
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+}
 #endif // GGML_USE_NCCL
 
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
@@ -1341,6 +1353,23 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
+// hybrid: NCCL for large tensors and the internal AllReduce for small ones; either one alone if the other fails.
+static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
+    ggml_backend_cuda_comm_init_nccl(ret);
+#ifdef GGML_USE_NCCL
+    if (ret->try_allreduce != ggml_backend_cuda_comm_try_allreduce_nccl) {
+        return; // NCCL unavailable, the chain already chose the internal AllReduce or the butterfly
+    }
+    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
+    if (ret->ar_pipeline) {
+        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_hybrid;
+    } else {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("internal AllReduce init failed; hybrid AllReduce uses NCCL only\n");
+    }
+#endif // GGML_USE_NCCL
+}
+
 // Top-level init.  Picks one of the three init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
 // any fallback.  Unrecognised env values warn and fall through to the
@@ -1373,6 +1402,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_nccl(ret);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
+        } else if (env_str == "hybrid") {
+            ggml_backend_cuda_comm_init_hybrid(ret);
         } else if (env_str == "none") {
             ggml_backend_cuda_comm_init_none(ret);
         } else {
