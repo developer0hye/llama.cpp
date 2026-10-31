@@ -1100,6 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_MIX",
     "TOP_K_MASK",
 
     "UNARY",
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_mix(mixes, scale, base)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
 
     "unary(x)",
@@ -1234,7 +1236,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6518,13 +6520,14 @@ struct ggml_tensor * ggml_lightning_indexer(
 
 // ggml_dsv4_hc_comb
 
-struct ggml_tensor * ggml_dsv4_hc_comb(
+static struct ggml_tensor * ggml_dsv4_hc_comb_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * mixes,
         struct ggml_tensor  * scale,
         struct ggml_tensor  * base,
         float                 eps,
-        int32_t               n_iter) {
+        int32_t               n_iter,
+        bool                  mix) {
     GGML_ASSERT(mixes->type == GGML_TYPE_F32);
     GGML_ASSERT(scale->type == GGML_TYPE_F32);
     GGML_ASSERT(base->type == GGML_TYPE_F32);
@@ -6554,17 +6557,41 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
     GGML_ASSERT(base->ne[2] == 1);
     GGML_ASSERT(base->ne[3] == 1);
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+    struct ggml_tensor * result = mix ?
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_mix_dim, n_tokens) :
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
 
     ggml_set_op_params_f32(result, 0, eps);
     ggml_set_op_params_i32(result, 1, n_iter);
 
-    result->op     = GGML_OP_DSV4_HC_COMB;
+    result->op     = mix ? GGML_OP_DSV4_HC_MIX : GGML_OP_DSV4_HC_COMB;
     result->src[0] = mixes;
     result->src[1] = scale;
     result->src[2] = base;
 
     return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_comb(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    return ggml_dsv4_hc_comb_impl(ctx, mixes, scale, base, eps, n_iter, false);
+}
+
+// ggml_dsv4_hc_mix
+
+struct ggml_tensor * ggml_dsv4_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    return ggml_dsv4_hc_comb_impl(ctx, mixes, scale, base, eps, n_iter, true);
 }
 
 // ggml_dsv4_hc_pre

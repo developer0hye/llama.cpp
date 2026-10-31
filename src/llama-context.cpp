@@ -165,6 +165,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_mix_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_MIX,
+    /*.name             =*/ "fused DeepSeek V4 HC mix",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
     /*.name             =*/ "fused top-k mask",
@@ -332,6 +338,7 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
+    cparams.fused_dsv4_hc_mix  = true;
     cparams.auto_fhc           = true;
 
     // only the indexer models build this mask, skip the probe for the others
@@ -680,6 +687,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        resolve(llm_fused_op_dsv4_hc_mix_probe,  cparams.fused_dsv4_hc_mix);
         cparams.auto_fhc = false;
     }
 

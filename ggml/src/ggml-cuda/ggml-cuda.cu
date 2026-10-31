@@ -2678,6 +2678,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_MIX:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_PRE:
@@ -6187,6 +6188,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_DELTA_NET:
             return true;
         case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_MIX:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_PRE:

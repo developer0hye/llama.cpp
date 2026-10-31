@@ -589,6 +589,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
         GGML_OP_TOP_K_MASK,
 
         GGML_OP_UNARY,
@@ -2748,6 +2749,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: the pre, post and comb weights of hc_comb's inputs in one op
+    //   mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc] -> [(2 + hc)*hc, n_tokens]
+    //   result[h,          t] = sigmoid(mixes[h, t]*scale[0] + base[h]) + eps           (pre,  h < hc)
+    //   result[hc + h,     t] = 2*sigmoid(mixes[hc + h, t]*scale[1] + base[hc + h])     (post, h < hc)
+    //   result[2*hc + i,   t] = hc_comb(mixes, scale, base, eps, n_iter)[i, t]           (comb, i < hc*hc)
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

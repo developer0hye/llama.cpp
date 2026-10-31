@@ -11377,10 +11377,19 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
 
     const int64_t n_tokens = mixes->ne[1];
 
+    // GGML_OP_DSV4_HC_MIX also writes the pre and post weights: rows [0, 2*hc) of a [hc_mix_dim, n_tokens] result,
+    // followed by comb in [dst, src] order
+    const bool mix = dst->op == GGML_OP_DSV4_HC_MIX;
+
     GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
-    GGML_ASSERT(dst->ne[0] == hc);
-    GGML_ASSERT(dst->ne[1] == hc);
-    GGML_ASSERT(dst->ne[2] == n_tokens);
+    if (mix) {
+        GGML_ASSERT(dst->ne[0] == hc_mix_dim);
+        GGML_ASSERT(dst->ne[1] == n_tokens);
+    } else {
+        GGML_ASSERT(dst->ne[0] == hc);
+        GGML_ASSERT(dst->ne[1] == hc);
+        GGML_ASSERT(dst->ne[2] == n_tokens);
+    }
     GGML_ASSERT(scale->ne[0] >= 3);
     GGML_ASSERT(base->ne[0] == hc_mix_dim);
 
@@ -11388,6 +11397,12 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
     GGML_TENSOR_LOCALS(size_t, nbs, scale, nb);
     GGML_TENSOR_LOCALS(size_t, nbb, base,  nb);
     GGML_TENSOR_LOCALS(size_t, nbd, dst,   nb);
+
+    // strides of comb[dst, src, token] in dst
+    const size_t sc0 = nbd0;
+    const size_t sc1 = mix ? hc*nbd0 : nbd1;
+    const size_t sc2 = mix ? nbd1    : nbd2;
+    char * dst_comb  = (char *) dst->data + (mix ? comb_offset*nbd0 : 0);
 
     const float eps = ggml_get_op_params_f32(dst, 0);
     const int32_t n_iter = ggml_get_op_params_i32(dst, 1);
@@ -11400,9 +11415,25 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
     const int64_t it0 = dr * ith;
     const int64_t it1 = MIN(it0 + dr, n_tokens);
 
+    const float scale_pre  = *(const float *) ((const char *) scale->data + 0*nbs0);
+    const float scale_post = *(const float *) ((const char *) scale->data + 1*nbs0);
     const float scale_comb = *(const float *) ((const char *) scale->data + 2*nbs0);
 
     for (int64_t it = it0; it < it1; ++it) {
+        if (mix) {
+            for (int64_t ih = 0; ih < hc; ++ih) {
+                const float xp = *(const float *) ((const char *) mixes->data + ih*nbm0 + it*nbm1);
+                const float bp = *(const float *) ((const char *) base->data  + ih*nbb0);
+                const float vp = xp * scale_pre;
+                *(float *) ((char *) dst->data + ih*nbd0 + it*nbd1) = 1.0f / (1.0f + expf(-(vp + bp))) + eps;
+
+                const float xq = *(const float *) ((const char *) mixes->data + (hc + ih)*nbm0 + it*nbm1);
+                const float bq = *(const float *) ((const char *) base->data  + (hc + ih)*nbb0);
+                const float vq = xq * scale_post;
+                *(float *) ((char *) dst->data + (hc + ih)*nbd0 + it*nbd1) = 2.0f * (1.0f / (1.0f + expf(-(vq + bq))));
+            }
+        }
+
         float comb[hc*hc];
 
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
@@ -11440,7 +11471,7 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             for (int64_t idst = 0; idst < hc; ++idst) {
                 const int64_t idx = idst + hc*isrc;
-                *(float *) ((char *) dst->data + idst*nbd0 + isrc*nbd1 + it*nbd2) = comb[idx];
+                *(float *) (dst_comb + idst*sc0 + isrc*sc1 + it*sc2) = comb[idx];
             }
         }
     }

@@ -33,11 +33,15 @@ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
     }
 }
 
+// mix: also write the pre and post weights to rows [0, 2*hc) of dst_mix (row stride sd0, token stride sd2), with the
+// same order of operations as the unfused graph (mul, add, sigmoid, then scale and bias)
+template <bool mix>
 static __global__ void dsv4_hc_comb_f32(
         const float * mixes,
         const float * scale,
         const float * base,
         float * dst,
+        float * dst_mix,
         int64_t n_tokens,
         int64_t sm0,
         int64_t sm1,
@@ -58,6 +62,18 @@ static __global__ void dsv4_hc_comb_f32(
     }
 
     ggml_cuda_pdl_sync();
+
+    if constexpr (mix) {
+        const float scale_pre  = scale[0*ss0];
+        const float scale_post = scale[1*ss0];
+        for (int ih = 0; ih < DSV4_HC; ++ih) {
+            const float vp = __fadd_rn(__fmul_rn(mixes[ih*sm0 + it*sm1], scale_pre), base[ih*sb0]);
+            dst_mix[ih*sd0 + it*sd2] = 1.0f / (1.0f + expf(-vp)) + eps;
+
+            const float vq = __fadd_rn(__fmul_rn(mixes[(DSV4_HC + ih)*sm0 + it*sm1], scale_post), base[(DSV4_HC + ih)*sb0]);
+            dst_mix[(DSV4_HC + ih)*sd0 + it*sd2] = 2.0f * (1.0f / (1.0f + expf(-vq)));
+        }
+    }
 
     const float scale_comb = scale[2*ss0];
     float comb[DSV4_HC*DSV4_HC];
@@ -214,10 +230,18 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     constexpr int64_t hc_mix_dim = (2 + DSV4_HC)*DSV4_HC;
 
+    // GGML_OP_DSV4_HC_MIX: [hc_mix_dim, n_tokens], the pre and post weights followed by comb in [dst, src] order
+    const bool mix = dst->op == GGML_OP_DSV4_HC_MIX;
+
     GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
-    GGML_ASSERT(dst->ne[0] == DSV4_HC);
-    GGML_ASSERT(dst->ne[1] == DSV4_HC);
-    GGML_ASSERT(dst->ne[2] == mixes->ne[1]);
+    if (mix) {
+        GGML_ASSERT(dst->ne[0] == hc_mix_dim);
+        GGML_ASSERT(dst->ne[1] == mixes->ne[1]);
+    } else {
+        GGML_ASSERT(dst->ne[0] == DSV4_HC);
+        GGML_ASSERT(dst->ne[1] == DSV4_HC);
+        GGML_ASSERT(dst->ne[2] == mixes->ne[1]);
+    }
     GGML_ASSERT(scale->ne[0] >= 3);
     GGML_ASSERT(base->ne[0] == hc_mix_dim);
 
@@ -230,19 +254,29 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const float eps = ggml_get_op_params_f32(dst, 0);
     const int32_t n_iter = ggml_get_op_params_i32(dst, 1);
 
+    // strides of comb[dst, src, token]
+    const int64_t sd0 = nbd0 / sizeof(float);
+    const int64_t sd1 = mix ? DSV4_HC*sd0 : nbd1 / sizeof(float);
+    const int64_t sd2 = mix ? nbd1 / sizeof(float) : nbd2 / sizeof(float);
+    float * dst_mix  = (float *) dst->data;
+    float * dst_comb = dst_mix + (mix ? 2*DSV4_HC*sd0 : 0);
+
     const int block_size = 256;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((n_tokens + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    ggml_cuda_kernel_launch(dsv4_hc_comb_f32, launch_params,
-            (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
-            n_tokens,
-            nbm0 / sizeof(float), nbm1 / sizeof(float),
-            nbs0 / sizeof(float),
-            nbb0 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
-            eps, n_iter);
+    if (mix) {
+        ggml_cuda_kernel_launch(dsv4_hc_comb_f32<true>, launch_params,
+                (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, dst_comb, dst_mix,
+                n_tokens, nbm0 / sizeof(float), nbm1 / sizeof(float), nbs0 / sizeof(float), nbb0 / sizeof(float),
+                sd0, sd1, sd2, eps, n_iter);
+    } else {
+        ggml_cuda_kernel_launch(dsv4_hc_comb_f32<false>, launch_params,
+                (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, dst_comb, dst_mix,
+                n_tokens, nbm0 / sizeof(float), nbm1 / sizeof(float), nbs0 / sizeof(float), nbb0 / sizeof(float),
+                sd0, sd1, sd2, eps, n_iter);
+    }
 }
 
 void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

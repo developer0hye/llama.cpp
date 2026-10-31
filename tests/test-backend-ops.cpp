@@ -4604,18 +4604,19 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     const int64_t n_tokens;
     const int32_t n_iter;
     const float eps;
+    const bool mix; // GGML_OP_DSV4_HC_MIX: the pre and post weights as well
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "DSV4_HC_COMB";
+        return mix ? "DSV4_HC_MIX" : "DSV4_HC_COMB";
     }
 
     std::string vars() override {
         return VARS_TO_STR3(n_tokens, n_iter, eps);
     }
 
-    test_dsv4_hc_comb(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f)
-        : n_tokens(n_tokens), n_iter(n_iter), eps(eps) {}
+    test_dsv4_hc_comb(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f, bool mix = false)
+        : n_tokens(n_tokens), n_iter(n_iter), eps(eps), mix(mix) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
@@ -4627,7 +4628,8 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
         ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
         ggml_set_name(base, "base");
 
-        out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
+        out = mix ? ggml_dsv4_hc_mix (ctx, mixes, scale, base, eps, n_iter) :
+                    ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
         ggml_set_name(out, "out");
         return out;
     }
@@ -10116,6 +10118,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // subgroup and workgroup boundaries; 1 = single-token decode
     for (int64_t n_tokens : {1, 256, 336, 512, 513, 1024, 2048}) {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
+    }
+    for (int64_t n_tokens : {1, 17, 257}) {
+        test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20, 1e-6f, /*mix =*/ true));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));

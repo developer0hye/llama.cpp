@@ -47,6 +47,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_dsv4_hc_mix;
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
