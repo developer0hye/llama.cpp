@@ -707,9 +707,17 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // window mask, then the comp mask at the selected rows (-inf where top-k picked an invisible row); one per top-k source
             ggml_tensor *& kq_mask = gather_mask_of[topk_src];
             if (!kq_mask) {
-                ggml_tensor * sel_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ci.kq_mask, 1, n_comp, nt), sel);
+                ggml_tensor *& comp_mask = gather_mask_view_of[ci.kq_mask];
+                if (!comp_mask) {
+                    comp_mask = ggml_reshape_3d(ctx0, ci.kq_mask, 1, n_comp, nt);
+                }
+                ggml_tensor *& win_mask = gather_mask_view_of[raw_mask];
+                if (!win_mask) {
+                    win_mask = ggml_reshape_4d(ctx0, raw_mask, raw_mask->ne[0], 1, 1, nt);
+                }
+                ggml_tensor * sel_mask = ggml_get_rows(ctx0, comp_mask, sel);
                 sel_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, sel_mask, k_sel, 1, 1, nt), GGML_TYPE_F16);
-                kq_mask = ggml_concat(ctx0, ggml_reshape_4d(ctx0, raw_mask, raw_mask->ne[0], 1, 1, nt), sel_mask, 0);
+                kq_mask = ggml_concat(ctx0, win_mask, sel_mask, 0);
                 cb(kq_mask, "comp_kq_mask_sel", il);
             }
 

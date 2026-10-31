@@ -1548,6 +1548,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
         std::map<int32_t, ggml_tensor *> gather_sel_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
+        // the reshaped view of each mask input, shared by all top-k sources: every view of an input is a
+        // separate input copy
+        std::map<const ggml_tensor *, ggml_tensor *> gather_mask_view_of;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
