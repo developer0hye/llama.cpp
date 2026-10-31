@@ -856,8 +856,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
+            // a coarser granularity than the block size gives faster kernels, but not if it makes the slices uneven:
+            // every device then waits for the largest slice (DeepSeek-V4.1: 2304 rows over 8 devices)
+            int64_t blck_size_perf = std::lcm(blck_size, 128);
+            while (blck_size_perf > blck_size && blck_size_perf % 2 == 0 && (blck_size_perf/2) % blck_size == 0 &&
+                    segments[0].first % (int64_t(ud->n_devices)*blck_size_perf) != 0) {
+                blck_size_perf /= 2;
+            }
             return {blck_size_perf};
         }
 
