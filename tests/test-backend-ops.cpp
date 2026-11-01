@@ -13037,6 +13037,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_sum(GGML_TYPE_F32, it));
     }
 
+    // rows for the bitonic argsort: single rows (sparse-attention indexer sorts at decode) and MoE routing
+    for (auto ne : std::vector<std::array<int64_t, 4>>{{32, 1, 1, 1}, {256, 1, 1, 1}, {512, 1, 1, 1}, {1024, 1, 1, 1},
+            {128, 512, 1, 1}, {384, 512, 1, 1}, {1024, 16, 1, 1}, {1024, 512, 1, 1}}) {
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, ne, GGML_SORT_ORDER_ASC));
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, ne, GGML_SORT_ORDER_DESC));
+    }
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {65000,  16, 1, 1}));
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 1,  1, 1}));
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));

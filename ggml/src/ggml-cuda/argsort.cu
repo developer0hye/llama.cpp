@@ -227,6 +227,62 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     }
 }
 
+// The swap decision of bitonic_step for the pair (lo, hi) = (col, col ^ j) with col < col ^ j, up: (col & k) == 0.
+template<ggml_sort_order order>
+static inline __device__ bool bitonic_swap(const int i_lo, const int i_hi, const float x_lo, const float x_hi, const int ncols, const bool up) {
+    if (up) {
+        return i_lo >= ncols || (i_hi < ncols && (order == GGML_SORT_ORDER_ASC ? x_lo > x_hi : x_lo < x_hi));
+    }
+    return i_hi >= ncols || (i_lo < ncols && (order == GGML_SORT_ORDER_ASC ? x_lo < x_hi : x_lo > x_hi));
+}
+
+// The same network for rows that fit into one block, one column per thread (at least a warp): each thread keeps the
+// index and the value of its column in registers and both threads of a pair take the same decision, so the result is
+// the same. Stages with j below the warp size exchange with shuffles and need no barrier, only the others go through
+// shared memory.
+template<ggml_sort_order order>
+static __global__ void k_argsort_f32_i32_regs(const float * x, int * dst, const int ncols, int ncols_pad) {
+    const int row = blockIdx.x;
+    const int col = threadIdx.x;
+
+    const float * x_row = x + row * ncols;
+    extern __shared__ int sh_idx[];
+    float * sh_x = (float *) (sh_idx + blockDim.x);
+
+    // threads past ncols_pad (fewer columns than a warp) only ever pair with each other
+    int   idx = col;
+    float val = col < ncols ? x_row[col] : 0.0f;
+
+    for (int k = 2; k <= ncols_pad; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int   idx_p;
+            float val_p;
+            if (j >= WARP_SIZE) {
+                __syncthreads();
+                sh_idx[col] = idx;
+                sh_x[col]   = val;
+                __syncthreads();
+                idx_p = sh_idx[col ^ j];
+                val_p = sh_x[col ^ j];
+            } else {
+                idx_p = __shfl_xor_sync(0xffffffff, idx, j, WARP_SIZE);
+                val_p = __shfl_xor_sync(0xffffffff, val, j, WARP_SIZE);
+            }
+            const bool up   = (col & k) == 0;
+            const bool swap = (col & j) == 0 ? bitonic_swap<order>(idx, idx_p, val, val_p, ncols, up) :
+                                               bitonic_swap<order>(idx_p, idx, val_p, val, ncols, up);
+            if (swap) {
+                idx = idx_p;
+                val = val_p;
+            }
+        }
+    }
+
+    if (col < ncols) {
+        dst[row * ncols + col] = idx;
+    }
+}
+
 static int next_power_of_2(int x) {
     int n = 1;
     while (n < x) {
@@ -252,6 +308,21 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
 
     // FIXME: this limit could be raised by ~2-4x on Ampere or newer
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+
+    if (ncols_pad > 1 && ncols_pad <= CUDA_ARGSORT_BLOCK_SIZE) {
+        const int    nthreads      = ncols_pad < WARP_SIZE ? WARP_SIZE : ncols_pad;
+        const size_t shared_mem_xc = ncols_pad > WARP_SIZE ? nthreads * (sizeof(int) + sizeof(float)) : 0;
+        if (order == GGML_SORT_ORDER_ASC) {
+            k_argsort_f32_i32_regs<GGML_SORT_ORDER_ASC>
+                <<<block_nums, dim3(nthreads, 1, 1), shared_mem_xc, stream>>>(x, dst, ncols, ncols_pad);
+        } else if (order == GGML_SORT_ORDER_DESC) {
+            k_argsort_f32_i32_regs<GGML_SORT_ORDER_DESC>
+                <<<block_nums, dim3(nthreads, 1, 1), shared_mem_xc, stream>>>(x, dst, ncols, ncols_pad);
+        } else {
+            GGML_ABORT("fatal error");
+        }
+        return;
+    }
 
     if (order == GGML_SORT_ORDER_ASC) {
         k_argsort_f32_i32<GGML_SORT_ORDER_ASC>
